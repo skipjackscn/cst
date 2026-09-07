@@ -22,30 +22,48 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin" -ErrorAction SilentlyContinue
           net user runneradmin P@ssw0rd1qazXSW@#
 
-      - name: 3. Install & Connect Tailscale VPN
+      - name: 3. Install & Connect EasyTier
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
+          EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          # 获取 EasyTier 最新版本号并下载 Windows x86_64 压缩包
+          $latestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/EasyTier/EasyTier/releases/latest"
+          $asset = $latestRelease.assets | Where-Object { $_.name -like "*x86_64-pc-windows-msvc.zip" } | Select-Object -First 1
+          $downloadUrl = $asset.browser_download_url
 
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          Invoke-WebRequest -Uri $downloadUrl -OutFile "C:\easytier.zip"
+          Expand-Archive -Path "C:\easytier.zip" -DestinationPath "C:\easytier" -Force
 
-          Start-Sleep -Seconds 8
+          # 寻找解压后的 easytier-core.exe 文件路径
+          $easytierPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-core.exe").FullName
 
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          # 后台启动 EasyTier 并加入虚拟网段（主机名设为 github-rdp-server）
+          $argList = "-n `"$Env:EASYTIER_NETWORK_NAME`" -p `"$Env:EASYTIER_NETWORK_SECRET`" -m github-rdp-server --dhcp"
+          Start-Process -FilePath $easytierPath -ArgumentList $argList -WindowStyle Hidden
+
+          # 等待组网连接并获取 IP 地址
+          Start-Sleep -Seconds 10
+          $cliPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-cli.exe").FullName
+          
+          # 尝试读取虚拟 IP
+          $et_ip = "Connecting..."
+          for ($i = 0; $i -lt 10; $i++) {
+              $nodeInfo = & $cliPath node-info 2>$null
+              if ($nodeInfo -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') {
+                  $et_ip = $matches[1]
+                  break
+              }
+              Start-Sleep -Seconds 3
+          }
 
           Write-Host ""
           Write-Host "==========================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  EasyTier IP  : $et_ip" -ForegroundColor Yellow
           Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  >> Open mstsc and connect to: $et_ip" -ForegroundColor Magenta
           Write-Host "==========================================" -ForegroundColor Green
 
       - name: 4. Keep Server Alive (48 Hours)
