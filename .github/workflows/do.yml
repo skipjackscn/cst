@@ -1,4 +1,4 @@
-name: Windows Cloud RDP
+name: Windows Cloud RDP xit
 
 on:
   workflow_dispatch:
