@@ -1,0 +1,26 @@
+# 自建 EasyTier 共享节点（中继）
+#
+#   docker compose -f examples/docker-compose.relay.yml up -d
+#
+# 官方镜像用不了的话换成 ghcr.io/easytier/easytier:latest；
+# 若镜像入口不是 easytier-core，把 command 改成 ["/usr/local/bin/easytier-core", "-c", "/etc/easytier/relay.toml"]
+
+services:
+  easytier-relay:
+    image: easytier/easytier:latest
+    container_name: easytier-relay
+    restart: unless-stopped
+    # P2P 打洞效果最好的方式；不方便用 host 就改成下面的 ports 映射
+    network_mode: host
+    # ports:
+    #   - "11010:11010/tcp"
+    #   - "11010:11010/udp"
+    #   - "11011:11011/tcp"
+    #   - "11011:11011/udp"
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./easytier-relay.toml:/etc/easytier/relay.toml:ro
+    command: ["-c", "/etc/easytier/relay.toml"]

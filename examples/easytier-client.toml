@@ -1,0 +1,38 @@
+# EasyTier 配置示例 —— 客户端（你自己的电脑 / 另一台 Linux 服务器）
+# 用法：
+#   sudo easytier-core -c ~/easytier-client.toml
+#   easytier-cli peer          # 查看已连上的节点
+#   ping 10.126.126.10         # 应该能通
+#   mstsc -> 10.126.126.10:3389
+#
+# 客户端需要有 TUN 权限（root / 管理员），所以这里 no_tun = false。
+
+instance_name = "my-pc"
+hostname      = "my-pc"
+
+ipv4 = "10.126.126.100"
+dhcp = false
+
+listeners = [
+  "tcp://0.0.0.0:11010",
+  "udp://0.0.0.0:11010",
+]
+
+rpc_portal = "127.0.0.1:15888"
+
+[network_identity]
+network_name   = "my-rdp-net"
+network_secret = "ChangeMe_Secret!"
+
+# 与服务端填同一个共享节点，两边才能互相发现
+[[peer]]
+uri = "tcp://public.easytier.cn:11010"
+
+[flags]
+no_tun            = false   # 客户端要主动发起访问，必须建 TUN
+enable_encryption = true
+enable_ipv6       = false
+mtu               = 1380
+latency_first     = false
+disable_p2p       = false
+disable_udp_hole_punching = false
