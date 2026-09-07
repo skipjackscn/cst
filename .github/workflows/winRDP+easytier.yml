@@ -1,7 +1,35 @@
+# GitHub Actions: Windows RDP over EasyTier
+# 将本文件放到仓库 .github/workflows/winRDP+easytier.yml
+#
+# 必填 Secrets（Settings → Secrets and variables → Actions）:
+#   EASYTIER_NETWORK_NAME    与本地 EasyTier 相同的网络名
+#   EASYTIER_NETWORK_SECRET  与本地 EasyTier 相同的网络密钥
+# 可选 Secrets:
+#   EASYTIER_PEER            共享节点，默认 tcp://public.easytier.cn:11010
+#
+# 本地电脑必须用【同一网络名/密钥】加入 EasyTier，并连接同一共享节点，例如:
+#   easytier-core.exe -d --network-name <NAME> --network-secret <SECRET> -p tcp://public.easytier.cn:11010
+#
+# 跑完 Step 3 后，用日志里打印的 EasyTier IP，mstsc 连接即可。
+# GitHub 托管 runner 最长约 6 小时，到时会自动断开。
+
 name: Windows Cloud RDP easytier
 
 on:
   workflow_dispatch:
+    inputs:
+      network_name:
+        description: "EasyTier 网络名称（留空则用 Secret EASYTIER_NETWORK_NAME）"
+        required: false
+        default: ""
+      network_secret:
+        description: "EasyTier 网络密钥（留空则用 Secret EASYTIER_NETWORK_SECRET）"
+        required: false
+        default: ""
+      peer:
+        description: "共享节点 URI，例如 tcp://public.easytier.cn:11010"
+        required: false
+        default: "tcp://public.easytier.cn:11010"
 
 jobs:
   build:
@@ -10,63 +38,222 @@ jobs:
 
     steps:
       - name: 1. Enable Remote Desktop & Firewall
+        shell: powershell
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          $ErrorActionPreference = 'Stop'
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 1 -Force
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP-EasyTier-3389' -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'EasyTier-11010-TCP' -Direction Inbound -Protocol TCP -LocalPort 11010 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'EasyTier-11010-UDP' -Direction Inbound -Protocol UDP -LocalPort 11010 -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+
+          # GitHub runner 是一次性机器，关掉防火墙避免新 TUN 网卡被拦 RDP
+          Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+
+          Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+          Write-Host 'RDP enabled.'
 
       - name: 2. Create Admin Account
+        shell: powershell
         run: |
-          $Password = ConvertTo-SecureString "P@ssw0rd1qazXSW@#" -AsPlainText -Force
-          New-LocalUser -Name "NvdAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "NvdAdmin" -ErrorAction SilentlyContinue
+          $ErrorActionPreference = 'Stop'
+          $Password = ConvertTo-SecureString 'P@ssw0rd1qazXSW@#' -AsPlainText -Force
+          New-LocalUser -Name 'NvdAdmin' -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Administrators' -Member 'NvdAdmin' -ErrorAction SilentlyContinue
           net user runneradmin P@ssw0rd1qazXSW@#
+          net user NvdAdmin P@ssw0rd1qazXSW@#
+          Write-Host 'Admin account ready.'
 
       - name: 3. Install & Connect EasyTier
+        shell: powershell
         env:
           EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
           EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
           EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
+          INPUT_NETWORK_NAME: ${{ github.event.inputs.network_name }}
+          INPUT_NETWORK_SECRET: ${{ github.event.inputs.network_secret }}
+          INPUT_PEER: ${{ github.event.inputs.peer }}
         run: |
-          # 直接下载指定的 EasyTier v2.6.4 压缩包
-          $downloadUrl = "https://github.com/EasyTier/EasyTier/releases/download/v2.6.4/easytier-windows-x86_64-v2.6.4.zip"
-          Invoke-WebRequest -Uri $downloadUrl -OutFile "C:\easytier.zip"
-          Expand-Archive -Path "C:\easytier.zip" -DestinationPath "C:\easytier" -Force
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-          # 递归寻找解压后的 easytier-core.exe 文件路径
-          $easytierPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-core.exe").FullName
-
-          # 使用正确的参数名启动 EasyTier：--network-name, --network-secret, --hostname, --dhcp, -p
-          $argList = "--network-name `"$Env:EASYTIER_NETWORK_NAME`" --network-secret `"$Env:EASYTIER_NETWORK_SECRET`" --hostname github-rdp-server --dhcp -p `"$Env:EASYTIER_PEER`""
-          Start-Process -FilePath $easytierPath -ArgumentList $argList -WindowStyle Hidden
-
-          # 等待组网连接并获取 IP 地址
-          Start-Sleep -Seconds 15
-          $cliPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-cli.exe").FullName
-          
-          # 尝试读取虚拟 IP
-          $et_ip = "Connecting..."
-          for ($i = 0; $i -lt 10; $i++) {
-              $nodeInfo = & $cliPath node-info 2>$null
-              if ($nodeInfo -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') {
-                  $et_ip = $matches[1]
-                  break
+          function Fail([string]$msg) {
+            Write-Host $msg -ForegroundColor Red
+            if (Test-Path 'C:\easytier-logs') {
+              Write-Host '===== easytier logs =====' -ForegroundColor Yellow
+              Get-ChildItem 'C:\easytier-logs' -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "----- $($_.Name) -----"
+                Get-Content $_.FullName -Tail 80 -ErrorAction SilentlyContinue
               }
-              Start-Sleep -Seconds 3
+            }
+            exit 1
           }
 
-          Write-Host ""
-          Write-Host "==========================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  EasyTier IP  : $et_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : NvdAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : P@ssw0rd1qazXSW@#" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $et_ip" -ForegroundColor Magenta
-          Write-Host "==========================================" -ForegroundColor Green
+          $netName = "$env:INPUT_NETWORK_NAME".Trim()
+          if ([string]::IsNullOrWhiteSpace($netName)) { $netName = "$env:EASYTIER_NETWORK_NAME".Trim() }
+          $netSecret = "$env:INPUT_NETWORK_SECRET".Trim()
+          if ([string]::IsNullOrWhiteSpace($netSecret)) { $netSecret = "$env:EASYTIER_NETWORK_SECRET".Trim() }
+          $peer = "$env:INPUT_PEER".Trim()
+          if ([string]::IsNullOrWhiteSpace($peer)) { $peer = "$env:EASYTIER_PEER".Trim() }
+          if ([string]::IsNullOrWhiteSpace($peer)) { $peer = 'tcp://public.easytier.cn:11010' }
 
-      - name: 4. Keep Server Alive (48 Hours)
+          if ([string]::IsNullOrWhiteSpace($netName) -or [string]::IsNullOrWhiteSpace($netSecret)) {
+            Fail 'EASYTIER_NETWORK_NAME / EASYTIER_NETWORK_SECRET 为空。请在仓库 Secrets 中配置，或在 Run workflow 时填写 inputs。'
+          }
+
+          $installRoot = 'C:\EasyTier'
+          $logDir = 'C:\easytier-logs'
+          $zipPath = 'C:\easytier.zip'
+          New-Item -ItemType Directory -Force -Path $installRoot, $logDir | Out-Null
+
+          $version = 'v2.6.4'
+          $downloadUrl = "https://github.com/EasyTier/EasyTier/releases/download/$version/easytier-windows-x86_64-$version.zip"
+          Write-Host "Downloading EasyTier $version ..."
+          $curlOk = $false
+          try {
+            & curl.exe -L --fail --retry 3 --retry-delay 2 -o $zipPath $downloadUrl
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $zipPath) -and ((Get-Item $zipPath).Length -gt 1MB)) { $curlOk = $true }
+          } catch { $curlOk = $false }
+
+          if (-not $curlOk) {
+            Write-Host 'curl failed, fallback to Invoke-WebRequest'
+            Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
+          }
+          if (-not (Test-Path $zipPath) -or ((Get-Item $zipPath).Length -lt 1MB)) {
+            Fail "EasyTier zip 下载失败: $downloadUrl"
+          }
+
+          $extractDir = 'C:\easytier-extract'
+          if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          $coreItem = Get-ChildItem -Path $extractDir -Recurse -Filter 'easytier-core.exe' | Select-Object -First 1
+          if (-not $coreItem) { Fail '解压后未找到 easytier-core.exe' }
+          $srcDir = $coreItem.Directory.FullName
+          Copy-Item -Path (Join-Path $srcDir '*') -Destination $installRoot -Recurse -Force
+          Get-ChildItem $installRoot -Recurse | Unblock-File -ErrorAction SilentlyContinue
+
+          $easytierPath = Join-Path $installRoot 'easytier-core.exe'
+          $cliPath = Join-Path $installRoot 'easytier-cli.exe'
+          if (-not (Test-Path $easytierPath)) { Fail "找不到 $easytierPath" }
+          if (-not (Test-Path $cliPath)) { Fail "找不到 $cliPath" }
+          if (-not (Test-Path (Join-Path $installRoot 'wintun.dll'))) {
+            Write-Host 'WARNING: wintun.dll 不在安装目录，TUN 网卡可能创建失败' -ForegroundColor Yellow
+          }
+
+          Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 1
+
+          function EscToml([string]$s) { $s.Replace('\', '\\').Replace('"', '\"') }
+          $peerLines = @()
+          $peersSeen = @{}
+          foreach ($uri in @($peer, 'tcp://public.easytier.cn:11010', 'tcp://public.easytier.top:11010')) {
+            $u = "$uri".Trim()
+            if ([string]::IsNullOrWhiteSpace($u)) { continue }
+            if ($peersSeen.ContainsKey($u)) { continue }
+            $peersSeen[$u] = $true
+            $peerLines += "[[peer]]"
+            $peerLines += "uri = `"$(EscToml $u)`""
+            $peerLines += ""
+          }
+          $toml = @(
+            "hostname = `"github-rdp-server`"",
+            "dhcp = true",
+            "rpc_portal = `"127.0.0.1:15888`"",
+            "listeners = [`"tcp://0.0.0.0:11010`", `"udp://0.0.0.0:11010`", `"wg://0.0.0.0:11011`"]",
+            "",
+            "[network_identity]",
+            "network_name = `"$(EscToml $netName)`"",
+            "network_secret = `"$(EscToml $netSecret)`"",
+            ""
+          ) + $peerLines + @(
+            "[flags]",
+            "enable_encryption = true",
+            "multi_thread = true",
+            "latency_first = true",
+            "enable_ipv6 = false"
+          )
+          $configPath = Join-Path $installRoot 'config.toml'
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllLines($configPath, $toml, $utf8NoBom)
+          Write-Host "config.toml written to $configPath"
+          Write-Host "network_name = $netName"
+          Write-Host "peer = $peer"
+
+          $argLine = "--config-file `"$configPath`" --file-log-dir `"$logDir`" --file-log-level info"
+          $proc = Start-Process -FilePath $easytierPath -WorkingDirectory $installRoot -ArgumentList $argLine -WindowStyle Hidden -PassThru
+          if (-not $proc -or $proc.HasExited) {
+            Start-Sleep -Seconds 2
+            $proc = Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if (-not $proc) { Fail 'easytier-core 启动后立即退出，见上方日志' }
+          Write-Host "easytier-core pid=$($proc.Id)"
+
+          $et_ip = $null
+          for ($i = 1; $i -le 40; $i++) {
+            Start-Sleep -Seconds 3
+            $alive = Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue
+            if (-not $alive) { Fail "easytier-core 在等待 IP 时退出（第 $i 次轮询）" }
+
+            $ErrorActionPreference = 'Continue'
+            $nodeOut = & $cliPath --rpc-portal 127.0.0.1:15888 node 2>&1 | Out-String
+            $peerOut = & $cliPath --rpc-portal 127.0.0.1:15888 peer 2>&1 | Out-String
+            $ErrorActionPreference = 'Stop'
+            $global:LASTEXITCODE = 0
+
+            Write-Host "[$i/40] node:`n$nodeOut"
+            if ($i -eq 1 -or $i % 5 -eq 0) { Write-Host "peer:`n$peerOut" }
+
+            if ($nodeOut -match 'Virtual IP\s*\|\s*(\d{1,3}(?:\.\d{1,3}){3})') {
+              $cand = $Matches[1]
+              if ($cand -ne '0.0.0.0') { $et_ip = $cand; break }
+            }
+            if (-not $et_ip -and $peerOut -match '(\d{1,3}(?:\.\d{1,3}){3})\s*\|\s*github-rdp-server') {
+              $et_ip = $Matches[1]; break
+            }
+            $tunIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+              Where-Object { $_.IPAddress -like '10.*' -and $_.InterfaceAlias -match 'easytier|et_|tun|Wintun' } |
+              Select-Object -First 1 -ExpandProperty IPAddress
+            if ($tunIp) { $et_ip = $tunIp; break }
+          }
+
+          if (-not $et_ip) { Fail '等待 EasyTier 虚拟 IP 超时。请确认本地客户端使用相同网络名/密钥，并已连接同一共享节点。' }
+
+          Write-Host ''
+          Write-Host '==========================================' -ForegroundColor Green
+          Write-Host '  >>> RDP SERVER IS READY! <<<' -ForegroundColor Cyan
+          Write-Host "  EasyTier IP  : $et_ip" -ForegroundColor Yellow
+          Write-Host '  Username     : NvdAdmin' -ForegroundColor Yellow
+          Write-Host '  Password     : P@ssw0rd1qazXSW@#' -ForegroundColor Yellow
+          Write-Host "  >> Open mstsc and connect to: $et_ip" -ForegroundColor Magenta
+          Write-Host '==========================================' -ForegroundColor Green
+
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      - name: 4. Keep Server Alive (GitHub max ~6 hours)
+        shell: powershell
         run: |
-          for ($i = 1; $i -le 2880; $i++) {
-              Start-Sleep -Seconds 60
-              Write-Host "[$i/2880] Server running..."
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $installRoot = 'C:\EasyTier'
+          $easytierPath = Join-Path $installRoot 'easytier-core.exe'
+          $configPath = Join-Path $installRoot 'config.toml'
+          $logDir = 'C:\easytier-logs'
+
+          for ($i = 1; $i -le 360; $i++) {
+            $alive = Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue
+            if (-not $alive) {
+              Write-Host "[$i/360] easytier-core 已退出，正在重启..." -ForegroundColor Yellow
+              Start-Process -FilePath $easytierPath -WorkingDirectory $installRoot -ArgumentList "--config-file `"$configPath`" --file-log-dir `"$logDir`" --file-log-level info" -WindowStyle Hidden | Out-Null
+            } else {
+              Write-Host "[$i/360] Server running, easytier pid=$($alive.Id)"
+            }
+            Start-Sleep -Seconds 60
           }
