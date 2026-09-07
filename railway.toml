@@ -1,9 +1,0 @@
-# Railway 配置即代码
-# 文档: https://docs.railway.com/reference/config-as-code
-[build]
-builder = "dockerfile"
-dockerfilePath = "Dockerfile"
-
-[deploy]
-healthcheckTimeout = 600
-restartPolicyType = "always"
