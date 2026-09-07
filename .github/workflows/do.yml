@@ -26,22 +26,17 @@ jobs:
         env:
           EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
           EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
-          # 新增节点变量，例如填入：tcp://***org:11010
           EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
         run: |
-          # 获取 EasyTier 最新版本号并下载 Windows x86_64 压缩包
-          $latestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/EasyTier/EasyTier/releases/latest"
-          $asset = $latestRelease.assets | Where-Object { $_.name -like "*x86_64-pc-windows-msvc.zip" } | Select-Object -First 1
-          $downloadUrl = $asset.browser_download_url
-
+          # 直接下载指定的 EasyTier v2.6.4 压缩包
+          $downloadUrl = "https://github.com/EasyTier/EasyTier/releases/download/v2.6.4/easytier-windows-x86_64-v2.6.4.zip"
           Invoke-WebRequest -Uri $downloadUrl -OutFile "C:\easytier.zip"
           Expand-Archive -Path "C:\easytier.zip" -DestinationPath "C:\easytier" -Force
 
-          # 寻找解压后的 easytier-core.exe 文件路径
+          # 递归寻找解压后的 easytier-core.exe 文件路径
           $easytierPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-core.exe").FullName
 
-          # 使用正确的参数名启动 EasyTier：--network-name, --network-secret, --hostname, -p
-          # 注意：保留了 --dhcp 来获取虚拟网卡 IP，不可使用 --no-tun 否则无法 RDP
+          # 使用正确的参数名启动 EasyTier：--network-name, --network-secret, --hostname, --dhcp, -p
           $argList = "--network-name `"$Env:EASYTIER_NETWORK_NAME`" --network-secret `"$Env:EASYTIER_NETWORK_SECRET`" --hostname github-rdp-server --dhcp -p `"$Env:EASYTIER_PEER`""
           Start-Process -FilePath $easytierPath -ArgumentList $argList -WindowStyle Hidden
 
