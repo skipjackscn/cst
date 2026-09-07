@@ -1,31 +1,15 @@
 # GitHub Actions: Windows RDP over EasyTier
 # 放到 .github/workflows/winRDP+easytier.yml
 #
-# Secrets:
-#   EASYTIER_NETWORK_NAME     必填，与本地相同
-#   EASYTIER_NETWORK_SECRET   必填，与本地相同
+# 从仓库 Settings - Secrets and variables - Actions 读取:
+#   EASYTIER_NETWORK_NAME     必填
+#   EASYTIER_NETWORK_SECRET   必填
 #   EASYTIER_PEER             可选，默认 tcp://public.easytier.cn:11010
-#
-# 本机:
-#   easytier-core.exe -d --network-name <NAME> --network-secret <SECRET> -p tcp://public.easytier.cn:11010
 
 name: Windows Cloud RDP easytier
 
 on:
   workflow_dispatch:
-    inputs:
-      network_name:
-        description: EasyTier network name (empty = use secret)
-        required: false
-        default: ""
-      network_secret:
-        description: EasyTier network secret (empty = use secret)
-        required: false
-        default: ""
-      peer:
-        description: Shared node URI
-        required: false
-        default: "tcp://public.easytier.cn:11010"
 
 jobs:
   build:
@@ -64,9 +48,6 @@ jobs:
           EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
           EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
           EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
-          INPUT_NETWORK_NAME: ${{ github.event.inputs.network_name }}
-          INPUT_NETWORK_SECRET: ${{ github.event.inputs.network_secret }}
-          INPUT_PEER: ${{ github.event.inputs.peer }}
         run: |
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
@@ -85,16 +66,13 @@ jobs:
             exit 1
           }
 
-          $netName = ([string]$env:INPUT_NETWORK_NAME).Trim()
-          if ([string]::IsNullOrWhiteSpace($netName)) { $netName = ([string]$env:EASYTIER_NETWORK_NAME).Trim() }
-          $netSecret = ([string]$env:INPUT_NETWORK_SECRET).Trim()
-          if ([string]::IsNullOrWhiteSpace($netSecret)) { $netSecret = ([string]$env:EASYTIER_NETWORK_SECRET).Trim() }
-          $peer = ([string]$env:INPUT_PEER).Trim()
-          if ([string]::IsNullOrWhiteSpace($peer)) { $peer = ([string]$env:EASYTIER_PEER).Trim() }
+          $netName = ([string]$env:EASYTIER_NETWORK_NAME).Trim()
+          $netSecret = ([string]$env:EASYTIER_NETWORK_SECRET).Trim()
+          $peer = ([string]$env:EASYTIER_PEER).Trim()
           if ([string]::IsNullOrWhiteSpace($peer)) { $peer = 'tcp://public.easytier.cn:11010' }
 
           if ([string]::IsNullOrWhiteSpace($netName) -or [string]::IsNullOrWhiteSpace($netSecret)) {
-            Fail 'Missing EASYTIER_NETWORK_NAME or EASYTIER_NETWORK_SECRET. Set repo Secrets or workflow inputs.'
+            Fail 'Missing EASYTIER_NETWORK_NAME or EASYTIER_NETWORK_SECRET in repository secrets.'
           }
 
           $installRoot = 'C:\EasyTier'
@@ -144,8 +122,6 @@ jobs:
             return $s.Replace('\', '\\').Replace('"', '\"')
           }
 
-          $peerUris = @($peer, 'tcp://public.easytier.cn:11010', 'tcp://public.easytier.top:11010')
-          $seen = @{}
           $toml = New-Object System.Collections.Generic.List[string]
           [void]$toml.Add('hostname = "github-rdp-server"')
           [void]$toml.Add('dhcp = true')
@@ -156,15 +132,9 @@ jobs:
           [void]$toml.Add(('network_name = "' + (EscToml $netName) + '"'))
           [void]$toml.Add(('network_secret = "' + (EscToml $netSecret) + '"'))
           [void]$toml.Add('')
-          foreach ($uri in $peerUris) {
-            $u = ([string]$uri).Trim()
-            if ([string]::IsNullOrWhiteSpace($u)) { continue }
-            if ($seen.ContainsKey($u)) { continue }
-            $seen[$u] = $true
-            [void]$toml.Add('[[peer]]')
-            [void]$toml.Add(('uri = "' + (EscToml $u) + '"'))
-            [void]$toml.Add('')
-          }
+          [void]$toml.Add('[[peer]]')
+          [void]$toml.Add(('uri = "' + (EscToml $peer) + '"'))
+          [void]$toml.Add('')
           [void]$toml.Add('[flags]')
           [void]$toml.Add('enable_encryption = true')
           [void]$toml.Add('multi_thread = true')
@@ -175,7 +145,6 @@ jobs:
           $utf8NoBom = New-Object System.Text.UTF8Encoding $false
           [System.IO.File]::WriteAllLines($configPath, $toml.ToArray(), $utf8NoBom)
           Write-Host ('Wrote ' + $configPath)
-          Write-Host ('network_name = ' + $netName)
           Write-Host ('peer = ' + $peer)
 
           $argLine = '--config-file ' + $configPath + ' --file-log-dir ' + $logDir + ' --file-log-level info'
