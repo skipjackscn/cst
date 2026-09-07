@@ -26,6 +26,8 @@ jobs:
         env:
           EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
           EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
+          # 新增节点变量，例如填入：tcp://***org:11010
+          EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
         run: |
           # 获取 EasyTier 最新版本号并下载 Windows x86_64 压缩包
           $latestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/EasyTier/EasyTier/releases/latest"
@@ -38,12 +40,13 @@ jobs:
           # 寻找解压后的 easytier-core.exe 文件路径
           $easytierPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-core.exe").FullName
 
-          # 后台启动 EasyTier 并加入虚拟网段（主机名设为 github-rdp-server）
-          $argList = "-n `"$Env:EASYTIER_NETWORK_NAME`" -p `"$Env:EASYTIER_NETWORK_SECRET`" -m github-rdp-server --dhcp"
+          # 使用正确的参数名启动 EasyTier：--network-name, --network-secret, --hostname, -p
+          # 注意：保留了 --dhcp 来获取虚拟网卡 IP，不可使用 --no-tun 否则无法 RDP
+          $argList = "--network-name `"$Env:EASYTIER_NETWORK_NAME`" --network-secret `"$Env:EASYTIER_NETWORK_SECRET`" --hostname github-rdp-server --dhcp -p `"$Env:EASYTIER_PEER`""
           Start-Process -FilePath $easytierPath -ArgumentList $argList -WindowStyle Hidden
 
           # 等待组网连接并获取 IP 地址
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 15
           $cliPath = (Get-ChildItem -Path "C:\easytier" -Recurse -Filter "easytier-cli.exe").FullName
           
           # 尝试读取虚拟 IP
