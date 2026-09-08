@@ -1,0 +1,17 @@
+#cloud-config
+hostname: cst-debian
+manage_etc_hosts: true
+ssh_pwauth: true
+disable_root: false
+write_files:
+  - path: /root/easytier.env
+    permissions: "0600"
+    owner: root:root
+    encoding: b64
+    content: __EASYTIER_ENV_B64__
+runcmd:
+  - [bash, -lc, "apt-get update"]
+  - [bash, -lc, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates wget"]
+  - [bash, -lc, "curl -fsSL https://raw.githubusercontent.com/skipjackscn/cst/main/scripts/debian-easytier-bootstrap.sh -o /root/debian-easytier-bootstrap.sh"]
+  - [bash, -lc, "chmod 700 /root/debian-easytier-bootstrap.sh && /root/debian-easytier-bootstrap.sh"]
+  - [bash, -lc, "rm -f /root/debian-easytier-bootstrap.sh"]
