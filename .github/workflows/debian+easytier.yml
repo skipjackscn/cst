@@ -1,0 +1,233 @@
+# GitHub Actions: Debian latest + EasyTier
+#
+# 从仓库 Settings -> Secrets and variables -> Actions 读取：
+#   EASYTIER_NETWORK_NAME     必填
+#   EASYTIER_NETWORK_SECRET   必填
+#   EASYTIER_PEER             可选，默认 tcp://public.easytier.cn:11010
+#
+# 说明：GitHub-hosted runner 没有 debian-latest 标签，因此本 Workflow
+# 使用官方 debian:latest 容器作为 Debian 用户空间，并使用 privileged +
+# host network，让 EasyTier 能创建 TUN 并直接提供虚拟网络连接。
+# Debian 镜像会在每次运行时重新拉取，因此始终使用 Docker Hub 的 latest。
+
+name: Debian latest EasyTier
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 1. Start Debian latest container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull debian:latest
+          docker rm -f cst-debian 2>/dev/null || true
+          docker run -d \
+            --name cst-debian \
+            --privileged \
+            --network host \
+            --hostname cst-debian \
+            debian:latest \
+            /bin/bash -c 'trap : TERM INT; while true; do sleep 3600; done & wait'
+          echo 'Debian latest container started.'
+          docker exec cst-debian cat /etc/debian_version
+
+      - name: 2. Install SSH and basic tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker exec cst-debian bash -lc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              ca-certificates curl wget openssh-server iproute2 iputils-ping procps \
+              net-tools vim-tiny sudo
+            mkdir -p /run/sshd /root/.ssh
+            chmod 700 /root/.ssh
+            sed -i "s/^#\?PermitRootLogin.*/PermitRootLogin yes/" /etc/ssh/sshd_config
+            sed -i "s/^#\?PasswordAuthentication.*/PasswordAuthentication yes/" /etc/ssh/sshd_config
+            sed -i "s/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/" /etc/ssh/sshd_config
+            echo "root:CstDebian@2026!" | chpasswd
+            ssh-keygen -A
+            /usr/sbin/sshd
+          '
+          echo 'SSH server installed and started.'
+
+      - name: 3. Install and connect EasyTier
+        shell: bash
+        env:
+          EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
+          EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
+          EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${EASYTIER_NETWORK_NAME:-}" ] || [ -z "${EASYTIER_NETWORK_SECRET:-}" ]; then
+            echo 'ERROR: Missing EASYTIER_NETWORK_NAME or EASYTIER_NETWORK_SECRET in repository secrets.'
+            exit 1
+          fi
+
+          PEER="${EASYTIER_PEER:-tcp://public.easytier.cn:11010}"
+
+          docker exec -e EASYTIER_NETWORK_NAME="$EASYTIER_NETWORK_NAME" \
+            -e EASYTIER_NETWORK_SECRET="$EASYTIER_NETWORK_SECRET" \
+            -e EASYTIER_PEER="$PEER" cst-debian bash -s <<'DEBIAN_SCRIPT'
+          set -euo pipefail
+
+          export DEBIAN_FRONTEND=noninteractive
+          mkdir -p /opt/easytier /var/log/easytier
+
+          # 获取 EasyTier 最新 release；不把版本号写死。
+          version="$(curl -fsSL https://api.github.com/repos/EasyTier/EasyTier/releases/latest | \
+            sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n1)"
+          if [ -z "$version" ]; then
+            echo 'ERROR: Cannot determine latest EasyTier release.'
+            exit 1
+          fi
+
+          # GitHub release 文件名按当前 amd64 Linux runner 架构选择。
+          arch="$(dpkg --print-architecture)"
+          case "$arch" in
+            amd64) asset="easytier-linux-x86_64-${version}.zip" ;;
+            arm64) asset="easytier-linux-aarch64-${version}.zip" ;;
+            armhf) asset="easytier-linux-armv7-${version}.zip" ;;
+            *) echo "Unsupported Debian architecture: $arch"; exit 1 ;;
+          esac
+
+          url="https://github.com/EasyTier/EasyTier/releases/download/${version}/${asset}"
+          echo "Downloading EasyTier ${version}: ${url}"
+          rm -f /tmp/easytier.zip
+          curl -fL --retry 4 --retry-delay 2 -o /tmp/easytier.zip "$url"
+
+          apt-get install -y --no-install-recommends unzip
+          rm -rf /tmp/easytier-extract
+          mkdir -p /tmp/easytier-extract
+          unzip -oq /tmp/easytier.zip -d /tmp/easytier-extract
+
+          core="$(find /tmp/easytier-extract -type f -name 'easytier-core' | head -n1)"
+          cli="$(find /tmp/easytier-extract -type f -name 'easytier-cli' | head -n1)"
+          if [ -z "$core" ] || [ -z "$cli" ]; then
+            echo 'ERROR: easytier-core/easytier-cli not found in release archive.'
+            find /tmp/easytier-extract -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          cp "$core" /opt/easytier/easytier-core
+          cp "$cli" /opt/easytier/easytier-cli
+          chmod +x /opt/easytier/easytier-core /opt/easytier/easytier-cli
+
+          esc_toml() {
+            printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+          }
+
+          cat > /opt/easytier/config.toml <<EOF
+          hostname = "CST-DEBIAN"
+          ipv4 = "10.1.1.52/24"
+          dhcp = false
+          rpc_portal = "127.0.0.1:15888"
+          listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010", "wg://0.0.0.0:11011"]
+
+          [network_identity]
+          network_name = "$(esc_toml "$EASYTIER_NETWORK_NAME")"
+          network_secret = "$(esc_toml "$EASYTIER_NETWORK_SECRET")"
+
+          [[peer]]
+          uri = "$(esc_toml "$EASYTIER_PEER")"
+
+          [flags]
+          enable_encryption = true
+          multi_thread = true
+          latency_first = true
+          enable_exit_node = true
+          enable_ipv6 = false
+          EOF
+
+          chmod 600 /opt/easytier/config.toml
+
+          pkill -f '/opt/easytier/easytier-core' 2>/dev/null || true
+          nohup /opt/easytier/easytier-core \
+            --config-file /opt/easytier/config.toml \
+            --file-log-dir /var/log/easytier \
+            --file-log-level info \
+            >/var/log/easytier/easytier-console.log 2>&1 &
+
+          echo "EasyTier ${version} started."
+          sleep 3
+          pgrep -af easytier || true
+          DEBIAN_SCRIPT
+
+      - name: 4. Wait for EasyTier virtual IP and show connection info
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            sleep 3
+            if ! docker exec cst-debian pgrep -x easytier-core >/dev/null 2>&1; then
+              echo 'EasyTier process exited.'
+              docker exec cst-debian bash -lc 'tail -n 120 /var/log/easytier/easytier-console.log 2>/dev/null || true; ls -la /var/log/easytier/'
+              exit 1
+            fi
+
+            node_out="$(docker exec cst-debian /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true)"
+            echo "[$i/40] EasyTier node:"
+            echo "$node_out"
+
+            et_ip="$(printf '%s\n' "$node_out" | sed -nE 's/.*Virtual IP[[:space:]]*\|[[:space:]]*([0-9]+(\.[0-9]+){3}).*/\1/p' | head -n1)"
+            if [ -z "$et_ip" ]; then
+              et_ip="$(docker exec cst-debian ip -4 addr show 2>/dev/null | sed -nE 's/.*inet (10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1 || true)"
+            fi
+
+            if [ -n "$et_ip" ] && [ "$et_ip" != '0.0.0.0' ]; then
+              echo
+              echo '=========================================='
+              echo '  DEBIAN LATEST IS READY'
+              echo "  EasyTier IP : $et_ip"
+              echo '  SSH port    : 22'
+              echo '  SSH user    : root'
+              echo '  SSH password: CstDebian@2026!'
+              echo "  SSH target  : $et_ip"
+              echo '=========================================='
+              echo "EASYTIER_IP=$et_ip" >> "$GITHUB_ENV"
+              exit 0
+            fi
+          done
+
+          echo 'ERROR: Timed out waiting for EasyTier virtual IP.'
+          docker exec cst-debian bash -lc 'tail -n 160 /var/log/easytier/easytier-console.log 2>/dev/null || true'
+          exit 1
+
+      - name: 5. Verify SSH over EasyTier
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Testing SSH on EasyTier IP: ${EASYTIER_IP}"
+          docker exec cst-debian bash -lc "ss -lntp | grep ':22 ' || true"
+          if ! timeout 10 bash -c "</dev/tcp/${EASYTIER_IP}/22"; then
+            echo 'WARNING: TCP/22 is not reachable from the runner namespace.'
+            echo 'SSH is still listening inside Debian; use the EasyTier IP from another EasyTier node.'
+          else
+            echo 'TCP/22 reachable.'
+          fi
+
+      - name: 6. Keep Debian + EasyTier alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'Debian latest + EasyTier is running for up to 6 hours.'
+          for i in $(seq 1 360); do
+            if ! docker ps --format '{{.Names}}' | grep -qx cst-debian; then
+              echo 'Debian container stopped.'
+              exit 1
+            fi
+            if ! docker exec cst-debian pgrep -x easytier-core >/dev/null 2>&1; then
+              echo 'EasyTier stopped; restarting...'
+              docker exec cst-debian bash -lc 'nohup /opt/easytier/easytier-core --config-file /opt/easytier/config.toml --file-log-dir /var/log/easytier --file-log-level info >/var/log/easytier/easytier-console.log 2>&1 &'
+            fi
+            echo "[$i/360] Debian running; EasyTier running."
+            sleep 60
+          done
