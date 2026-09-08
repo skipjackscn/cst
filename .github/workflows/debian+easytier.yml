@@ -102,7 +102,15 @@ jobs:
             "ROOT_PASSWORD_B64=$(printf '%s' "$ROOT_PASSWORD" | base64 -w0)")"
           ET_ENV_B64="$(printf '%s' "$ET_ENV" | base64 -w0)"
           cp scripts/debian-cloud-init.yml "$VM_DIR/seed/user-data"
-          sed -i "s|__EASYTIER_ENV_B64__|$ET_ENV_B64|g" "$VM_DIR/seed/user-data"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          p = Path(os.environ['VM_DIR']) / 'seed' / 'user-data'
+          s = p.read_text()
+          s = s.replace('__EASYTIER_ENV_B64__', os.environ['ET_ENV_B64'])
+          s = s.replace('__ROOT_PASSWORD__', os.environ['ROOT_PASSWORD'])
+          p.write_text(s)
+          PY
           printf '%s\n' 'instance-id: cst-debian' 'local-hostname: cst-debian' > "$VM_DIR/seed/meta-data"
           printf '%s\n' 'version: 2' 'ethernets:' '  ens3:' '    dhcp4: true' > "$VM_DIR/seed/network-config"
           cloud-localds --network-config="$VM_DIR/seed/network-config" "$VM_DIR/seed.iso" "$VM_DIR/seed/user-data" "$VM_DIR/seed/meta-data"
@@ -142,44 +150,70 @@ jobs:
           set -euo pipefail
           PASSWORD="$DEBIAN_ROOT_PASSWORD"
           SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ConnectionAttempts=2)
-          for i in $(seq 1 90); do
+
+          echo 'Waiting for SSH...'
+          for i in $(seq 1 60); do
             if SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'echo SSH_OK' >/dev/null 2>&1; then
-              echo 'Debian SSH is ready.'
+              echo "Debian SSH is ready after $((i*2))s."
               break
             fi
-            if [[ "$i" -eq 90 ]]; then
+            if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
+              echo 'ERROR: QEMU stopped before SSH became available.'
+              tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
+              tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
+              exit 1
+            fi
+            if [[ "$i" -eq 60 ]]; then
               echo 'ERROR: Debian SSH timeout.'
               tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
               tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
               exit 1
             fi
-            sleep 4
+            sleep 2
           done
 
           ET_IP=''
-          for i in $(seq 1 72); do
-            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active easytier.service || true; ip -4 addr show || true; /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true' 2>/dev/null || true)"
-            echo "[$i/72] $OUT"
-            ET_IP="$(printf '%s\n' "$OUT" | sed -nE 's/.*Virtual IP[[:space:]]*\|[[:space:]]*(10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
-            if [[ -z "$ET_IP" ]]; then
-              ET_IP="$(printf '%s\n' "$OUT" | sed -nE 's/.*inet (10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
+          for i in $(seq 1 60); do
+            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'printf "cloud-init="; cloud-init status 2>/dev/null || true; printf " easytier="; systemctl is-active easytier.service 2>/dev/null || true; printf "\n"; ip -4 addr show; if systemctl is-active --quiet easytier.service 2>/dev/null; then /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true; fi' 2>&1 || true)"
+            echo "===== readiness [$i/60] ====="
+            echo "$OUT"
+
+            if printf '%s\n' "$OUT" | grep -q '10\.1\.1\.52/'; then
+              ET_IP='10.1.1.52'
+            else
+              ET_IP=''
             fi
-            if [[ -n "$ET_IP" ]]; then
+
+            if printf '%s\n' "$OUT" | grep -q '^cloud-init=error'; then
+              echo 'ERROR: cloud-init reported error.'
+              SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'tail -n 200 /var/log/cloud-init-output.log || true; tail -n 100 /var/log/cloud-init.log || true' || true
+              exit 1
+            fi
+
+            if printf '%s\n' "$OUT" | grep -q 'easytier=failed'; then
+              echo 'EasyTier service failed; printing journal.'
+              SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true' || true
+              exit 1
+            fi
+
+            if [[ "$ET_IP" == '10.1.1.52' ]]; then
               break
             fi
             sleep 5
           done
-          if [[ -z "$ET_IP" ]]; then
-            echo 'ERROR: EasyTier virtual IP was not detected.'
-            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true' || true
+
+          if [[ "$ET_IP" != '10.1.1.52' ]]; then
+            echo 'ERROR: EasyTier 10.1.1.52 was not detected.'
+            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true; ip -4 addr show || true' || true
             exit 1
           fi
+
           echo "EASYTIER_IP=$ET_IP" >> "$GITHUB_ENV"
           echo '=========================================='
           echo 'DEBIAN 13 QEMU/KVM + EASYTIER READY'
           echo "EasyTier IP : $ET_IP"
           echo 'SSH user    : root'
-          echo 'SSH port    : 22'
+          echo 'VM SSH port : 22222 on runner'
           echo '=========================================='
 
       - name: Keep VM alive
@@ -190,6 +224,7 @@ jobs:
             if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
               echo 'QEMU stopped unexpectedly.'
               tail -n 200 "$VM_DIR/qemu.log" 2>/dev/null || true
+              tail -n 200 "$VM_DIR/serial.log" 2>/dev/null || true
               exit 1
             fi
             echo "[$i/360] Debian VM running; EasyTier IP=$EASYTIER_IP"
