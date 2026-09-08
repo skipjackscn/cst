@@ -3,6 +3,12 @@ hostname: cst-debian
 manage_etc_hosts: true
 ssh_pwauth: true
 disable_root: false
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: __ROOT_PASSWORD__
+      type: text
 write_files:
   - path: /root/easytier.env
     permissions: "0600"
@@ -11,7 +17,8 @@ write_files:
     content: __EASYTIER_ENV_B64__
 runcmd:
   - [bash, -lc, "apt-get update"]
-  - [bash, -lc, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates wget"]
+  - [bash, -lc, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends curl ca-certificates wget openssh-server iproute2 iputils-ping procps sudo"]
+  - [bash, -lc, "mkdir -p /run/sshd && printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication yes' 'KbdInteractiveAuthentication no' 'PubkeyAuthentication yes' > /etc/ssh/sshd_config.d/99-cst.conf && systemctl enable --now ssh"]
   - [bash, -lc, "curl -fsSL https://raw.githubusercontent.com/skipjackscn/cst/main/scripts/debian-easytier-bootstrap.sh -o /root/debian-easytier-bootstrap.sh"]
   - [bash, -lc, "chmod 700 /root/debian-easytier-bootstrap.sh && /root/debian-easytier-bootstrap.sh"]
   - [bash, -lc, "rm -f /root/debian-easytier-bootstrap.sh"]
