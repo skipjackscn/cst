@@ -4,7 +4,9 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - .github/workflows/debian+easytier.yml
+      - '.github/workflows/debian+easytier.yml'
+      - 'scripts/debian-cloud-init.yml'
+      - 'scripts/debian-easytier-bootstrap.sh'
 
 permissions:
   contents: read
@@ -15,7 +17,7 @@ jobs:
     timeout-minutes: 360
     env:
       VM_NAME: cst-debian
-      VM_SSH_PORT: "22222"
+      VM_SSH_PORT: '22222'
       DEBIAN_IMAGE_URL: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
       EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
       EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
@@ -23,6 +25,17 @@ jobs:
       DEBIAN_ROOT_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$EASYTIER_NETWORK_NAME" || { echo 'Missing EASYTIER_NETWORK_NAME'; exit 1; }
+          test -n "$EASYTIER_NETWORK_SECRET" || { echo 'Missing EASYTIER_NETWORK_SECRET'; exit 1; }
+          test -n "$DEBIAN_ROOT_PASSWORD" || { echo 'Missing DEBIAN_ROOT_PASSWORD'; exit 1; }
+
       - name: Prepare VM directory
         shell: bash
         run: |
@@ -32,14 +45,7 @@ jobs:
           rm -rf "$VM_DIR"
           mkdir -p "$VM_DIR/seed"
 
-      - name: Check required secrets
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$EASYTIER_NETWORK_NAME" || { echo 'Missing EASYTIER_NETWORK_NAME'; exit 1; }
-          test -n "$EASYTIER_NETWORK_SECRET" || { echo 'Missing EASYTIER_NETWORK_SECRET'; exit 1; }
-
-      - name: Install QEMU and tools
+      - name: Install QEMU and cloud-init tools
         shell: bash
         run: |
           set -euo pipefail
@@ -47,31 +53,39 @@ jobs:
           sudo apt-get install -y qemu-system-x86 qemu-utils qemu-kvm cloud-image-utils openssh-client sshpass curl
           qemu-system-x86_64 --version | head -n1
 
-      - name: Verify KVM
+      - name: Select QEMU acceleration
         shell: bash
         run: |
           set -euo pipefail
-          test -e /dev/kvm || { echo 'ERROR: /dev/kvm is unavailable'; exit 1; }
-          sudo chmod 666 /dev/kvm || true
-          set +e
-          timeout 5s qemu-system-x86_64 -accel kvm -machine q35 -nodefaults -nographic -S -display none
-          rc=$?
-          set -e
-          if [[ $rc -ne 124 ]]; then
-            echo "ERROR: KVM self-test failed with exit code $rc"
-            exit 1
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 666 /dev/kvm || true
+            set +e
+            timeout 5s qemu-system-x86_64 -accel kvm -machine q35 -nodefaults -nographic -S -display none
+            rc=$?
+            set -e
+            if [[ $rc -eq 124 ]]; then
+              echo 'KVM acceleration available.'
+              echo 'QEMU_ACCEL=-accel kvm' >> "$GITHUB_ENV"
+              echo 'QEMU_CPU=-cpu host' >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "KVM self-test failed with exit code $rc; using TCG."
+          else
+            echo 'KVM device unavailable; using TCG.'
           fi
-          echo 'KVM OK.'
+          echo 'QEMU_ACCEL=-accel tcg,thread=multi' >> "$GITHUB_ENV"
+          echo 'QEMU_CPU=-cpu max' >> "$GITHUB_ENV"
 
-      - name: Download Debian 13 cloud image
+      - name: Download Debian 13 stable cloud image
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 5 --retry-delay 3 -o "$VM_DIR/debian.qcow2" "$DEBIAN_IMAGE_URL"
           test -s "$VM_DIR/debian.qcow2"
+          qemu-img info "$VM_DIR/debian.qcow2"
           qemu-img resize "$VM_DIR/debian.qcow2" 20G
 
-      - name: Build cloud-init seed
+      - name: Render cloud-init seed
         shell: bash
         env:
           ET_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
@@ -81,54 +95,28 @@ jobs:
         run: |
           set -euo pipefail
           PEER="${ET_PEER:-tcp://public.easytier.cn:11010}"
-          PASSWORD="${ROOT_PASSWORD:-CstDebian@2026!}"
-          CONFIG_B64="$(printf '%s\n' \
-            'instance_name = "cst-debian"' \
-            'hostname = "CST-DEBIAN"' \
-            'ipv4 = "10.1.1.52/24"' \
-            'dhcp = false' \
-            'listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010", "wg://0.0.0.0:11011"]' \
-            'rpc_portal = "127.0.0.1:15888"' \
-            '' \
-            '[network_identity]' \
-            "network_name = \"$ET_NAME\"" \
-            "network_secret = \"$ET_SECRET\"" \
-            '' \
-            '[[peer]]' \
-            "uri = \"$PEER\"" \
-            '' \
-            '[flags]' \
-            'default_protocol = "udp"' \
-            'enable_encryption = true' \
-            'enable_ipv6 = false' \
-            'latency_first = true' \
-            'enable_exit_node = true' \
-            'no_tun = false' \
-            'foreign_network_whitelist = "*"' \
-            | base64 -w0)"
-          PASS_B64="$(printf '%s' "$PASSWORD" | base64 -w0)"
-          SERVICE_B64='W1VuaXRdCkRlc2NyaXB0aW9uPUVhc3lUaWVyIFZpcnR1YWwgTmV0d29yawpXYW50cz1uZXR3b3JrLW9ubGluZS50YXJnZXQKQWZ0ZXI9bmV0d29yay1vbmxpbmUudGFyZ2V0CgpbU2VydmljZV0KVHlwZT1zaW1wbGUKRXhlY1N0YXJ0PS9vcHQvZWFzeXRpZXIvZWFzeXRpZXItY29yZSAtYyAvb3B0L2Vhc3l0aWVyL2NvbmZpZy9kZWZhdWx0LmNvbmYKUmVzdGFydD1hbHdheXMKUmVzdGFydFNlYz0zCkxpbWl0Tk9GSUxFPTEwNDg1NzYKCltJbnN0YWxsXQpXYW50ZWRCeT1tdWx0aS11c2VyLnRhcmdldAo='
-          USER_B64='I2Nsb3VkLWNvbmZpZwpob3N0bmFtZTogY3N0LWRlYmlhbgptYW5hZ2VfZXRjX2hvc3RzOiB0cnVlCnNzaF9wd2F1dGg6IHRydWUKZGlzYWJsZV9yb290OiBmYWxzZQp3cml0ZV9maWxlczoKICAtIHBhdGg6IC90bXAvcm9vdC1wYXNzLmI2NAogICAgcGVybWlzc2lvbnM6ICIwNjAwIgogICAgb3duZXI6IHJvb3Q6cm9vdAogICAgY29udGVudDogX19ST09UX1BBU1NfQjY0X18KICAtIHBhdGg6IC90bXAvZWFzeXRpZXItY29uZmlnLmI2NAogICAgcGVybWlzc2lvbnM6ICIwNjAwIgogICAgb3duZXI6IHJvb3Q6cm9vdAogICAgY29udGVudDogX19FVF9DT05GSUdfQjY0X18KICAtIHBhdGg6IC90bXAvZWFzeXRpZXItc2VydmljZS5iNjQKICAgIHBlcm1pc3Npb25zOiAiMDYwMCIKICAgIG93bmVyOiByb290OnJvb3QKICAgIGNvbnRlbnQ6IF9fU0VSVklDRV9CNjRfXwogIC0gcGF0aDogL2V0Yy9zc2gvc3NoZF9jb25maWcuZC85OS1jc3QuY29uZgogICAgcGVybWlzc2lvbnM6ICIwNjAwIgogICAgb3duZXI6IHJvb3Q6cm9vdAogICAgY29udGVudDogfAogICAgICBQZXJtaXRSb290TG9naW4geWVzCiAgICAgIFBhc3N3b3JkQXV0aGVudGljYXRpb24geWVzCiAgICAgIEtiZEludGVyYWN0aXZlQXV0aGVudGljYXRpb24gbm8KICAgICAgUHVia2V5QXV0aGVudGljYXRpb24geWVzCnJ1bmNtZDoKICAtIFtiYXNoLCAtbGMsIGFwdC1nZXQgdXBkYXRlICYmIGFwdC1nZXQgaW5zdGFsbCAteSAtLW5vLWluc3RhbGwtcmVjb21tZW5kcyBjYS1jZXJ0aWZpY2F0ZXMgY3VybCB3Z2V0IHVuemlwIG9wZW5zc2gtc2VydmVyIGlwcm91dGUyIGlwdXRpbHMtcGluZyBwcm9jcHMgbmV0LXRvb2xzIHN1ZG9dCiAgLSBbYmFzaCwgLWxjLCBwcmludGYgJ3Jvb3Q6JXNcXG4nIFwiJChCYXNlNjRfZGVjb2RlIC90bXAvcm9vdC1wYXNzLmI2NCkgJiBjaHBhc3N3ZF0KICAtIFtzeXN0ZW1jdGwsIGVuYWJsZSwgLS1ub3csIHNzaF0KICAtIFt3Z2V0LCAtcU8sIC90bXAvZWFzeXRpZXItaW5zdGFsbC5zaCwgaHR0cHM6Ly9yYXcuZ2l0aHVidXNlcmNvbnRlbnQuY29tL0Vhc3lUaWVyL0Vhc3lUaWVyL21haW4vc2NyaXB0L2luc3RhbGwuc2hdCiAgLSBbYmFzaCwgL3RtcC9lYXN5dGllci1pbnN0YWxsLnNoLCBpbnN0YWxsLCAvb3B0L2Vhc3l0aWVyLCAtLW5vLWdoLXByb3h5XQogIC0gW2Jhc2gsIC1sYywgIm1rZGlyIC1wIC9vcHQvZWFzeXRpZXIvY29uZmlnICYmIGJhc2U2NCAtZCAvdG1wL2Vhc3l0aWVyLWNvbmZpZy5iNjQgPiAvb3B0L2Vhc3l0aWVyL2NvbmZpZy9kZWZhdWx0LmNvbmYgJiYgYmFzZTY0IC1kIC90bXAvZWFzeXRpZXItc2VydmljZS5iNjQgPiAvZXRjL3N5c3RlbWQvc3lzdGVtL2Vhc3l0aWVyLnNlcnZpY2UgJiYgY2htb2QgNjAwIC9vcHQvZWFzeXRpZXIvY29uZmlnL2RlZmF1bHQuY29uZl0KICAtIFtzeXN0ZW1jdGwsIGRhZW1vbi1yZWxvYWRdCiAgLSBbc3lzdGVtY3RsLCBlbmFibGUsIC0tbm93LCBlYXN5dGllci5zZXJ2aWNlXQogIC0gW2Jhc2gsIC1sYywgInNsZWVwIDU7IHN5c3RlbWN0bCBpcy1hY3RpdmUgLS1xdWlldCBlYXN5dGllci5zZXJ2aWNlIl0K'
-          printf '%s' "$USER_B64" | base64 -d > "$VM_DIR/seed/user-data"
-          sed -i \
-            -e "s|__ROOT_PASS_B64__|$PASS_B64|g" \
-            -e "s|__ET_CONFIG_B64__|$CONFIG_B64|g" \
-            -e "s|__SERVICE_B64__|$SERVICE_B64|g" \
-            "$VM_DIR/seed/user-data"
+          ET_ENV="$(printf '%s\n' \
+            "ET_NAME_B64=$(printf '%s' "$ET_NAME" | base64 -w0)" \
+            "ET_SECRET_B64=$(printf '%s' "$ET_SECRET" | base64 -w0)" \
+            "ET_PEER_B64=$(printf '%s' "$PEER" | base64 -w0)" \
+            "ROOT_PASSWORD_B64=$(printf '%s' "$ROOT_PASSWORD" | base64 -w0)")"
+          ET_ENV_B64="$(printf '%s' "$ET_ENV" | base64 -w0)"
+          cp scripts/debian-cloud-init.yml "$VM_DIR/seed/user-data"
+          sed -i "s|__EASYTIER_ENV_B64__|$ET_ENV_B64|g" "$VM_DIR/seed/user-data"
           printf '%s\n' 'instance-id: cst-debian' 'local-hostname: cst-debian' > "$VM_DIR/seed/meta-data"
           printf '%s\n' 'version: 2' 'ethernets:' '  ens3:' '    dhcp4: true' > "$VM_DIR/seed/network-config"
           cloud-localds --network-config="$VM_DIR/seed/network-config" "$VM_DIR/seed.iso" "$VM_DIR/seed/user-data" "$VM_DIR/seed/meta-data"
           chmod 600 "$VM_DIR/seed/user-data"
 
-      - name: Boot Debian VM with QEMU/KVM
+      - name: Boot Debian VM
         shell: bash
         run: |
           set -euo pipefail
           nohup qemu-system-x86_64 \
             -name "$VM_NAME" \
-            -machine q35,accel=kvm \
-            -enable-kvm \
-            -cpu host \
+            -machine q35 \
+            $QEMU_ACCEL \
+            $QEMU_CPU \
             -smp 2 \
             -m 4096 \
             -drive "file=$VM_DIR/debian.qcow2,if=virtio,format=qcow2,cache=writeback" \
@@ -143,11 +131,11 @@ jobs:
           kill -0 "$(cat "$VM_DIR/qemu.pid")"
           echo 'Debian VM started.'
 
-      - name: Wait for Debian SSH and EasyTier
+      - name: Wait for Debian and EasyTier
         shell: bash
         run: |
           set -euo pipefail
-          PASSWORD="${DEBIAN_ROOT_PASSWORD:-CstDebian@2026!}"
+          PASSWORD="$DEBIAN_ROOT_PASSWORD"
           SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ConnectionAttempts=2)
           for i in $(seq 1 90); do
             if SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'echo SSH_OK' >/dev/null 2>&1; then
@@ -162,11 +150,10 @@ jobs:
             fi
             sleep 4
           done
-
           ET_IP=''
-          for i in $(seq 1 60); do
-            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active easytier.service || true; /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true; ip -4 addr show' 2>/dev/null || true)"
-            echo "[$i/60] $OUT"
+          for i in $(seq 1 72); do
+            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active easytier.service || true; ip -4 addr show || true; /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true' 2>/dev/null || true)"
+            echo "[$i/72] $OUT"
             ET_IP="$(printf '%s\n' "$OUT" | sed -nE 's/.*Virtual IP[[:space:]]*\|[[:space:]]*(10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
             if [[ -z "$ET_IP" ]]; then
               ET_IP="$(printf '%s\n' "$OUT" | sed -nE 's/.*inet (10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
@@ -177,7 +164,7 @@ jobs:
             sleep 5
           done
           if [[ -z "$ET_IP" ]]; then
-            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'journalctl -u easytier.service --no-pager -n 200 || true; cat /var/log/easytier/* 2>/dev/null || true' || true
+            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true' || true
             exit 1
           fi
           echo "EASYTIER_IP=$ET_IP" >> "$GITHUB_ENV"
@@ -201,3 +188,13 @@ jobs:
             echo "[$i/360] Debian VM running; EasyTier IP=$EASYTIER_IP"
             sleep 60
           done
+
+      - name: Collect VM logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          echo '===== qemu.log ====='
+          tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
+          echo '===== serial.log ====='
+          tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
