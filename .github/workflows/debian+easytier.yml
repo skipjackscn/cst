@@ -124,11 +124,16 @@ jobs:
             -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$VM_SSH_PORT-:22" \
             -device virtio-net-pci,netdev=net0 \
             -nographic \
-            -serial "file=$VM_DIR/serial.log" \
+            -serial "file:$VM_DIR/serial.log" \
             >"$VM_DIR/qemu.log" 2>&1 &
-          echo $! > "$VM_DIR/qemu.pid"
+          QEMU_PID=$!
+          echo "$QEMU_PID" > "$VM_DIR/qemu.pid"
           sleep 5
-          kill -0 "$(cat "$VM_DIR/qemu.pid")"
+          if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            echo 'ERROR: QEMU exited during startup.'
+            tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
+            exit 1
+          fi
           echo 'Debian VM started.'
 
       - name: Wait for Debian and EasyTier
@@ -144,12 +149,13 @@ jobs:
             fi
             if [[ "$i" -eq 90 ]]; then
               echo 'ERROR: Debian SSH timeout.'
-              tail -n 200 "$VM_DIR/serial.log" || true
-              tail -n 200 "$VM_DIR/qemu.log" || true
+              tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
+              tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
               exit 1
             fi
             sleep 4
           done
+
           ET_IP=''
           for i in $(seq 1 72); do
             OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active easytier.service || true; ip -4 addr show || true; /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true' 2>/dev/null || true)"
@@ -164,6 +170,7 @@ jobs:
             sleep 5
           done
           if [[ -z "$ET_IP" ]]; then
+            echo 'ERROR: EasyTier virtual IP was not detected.'
             SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true' || true
             exit 1
           fi
@@ -182,7 +189,7 @@ jobs:
           for i in $(seq 1 360); do
             if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
               echo 'QEMU stopped unexpectedly.'
-              tail -n 200 "$VM_DIR/qemu.log" || true
+              tail -n 200 "$VM_DIR/qemu.log" 2>/dev/null || true
               exit 1
             fi
             echo "[$i/360] Debian VM running; EasyTier IP=$EASYTIER_IP"
