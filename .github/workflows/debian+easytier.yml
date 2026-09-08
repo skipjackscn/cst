@@ -1,9 +1,4 @@
-# GitHub Actions: Debian latest QEMU/KVM + EasyTier
-# 使用 env.VM_DIR 时不能在 jobs.<job>.env 中引用 runner.temp。
-# GitHub Actions 的 runner 上下文在该位置不可用，因此改为在 step 中通过
-# $RUNNER_TEMP 设置工作目录。
-
-name: Debian latest QEMU-KVM EasyTier
+name: Debian 13 QEMU KVM EasyTier
 
 on:
   workflow_dispatch:
@@ -15,7 +10,6 @@ jobs:
   debian-vm:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
       VM_NAME: cst-debian
       VM_SSH_PORT: '22222'
@@ -26,194 +20,174 @@ jobs:
       DEBIAN_ROOT_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
 
     steps:
-      - name: 1. Prepare VM directory
+      - name: Prepare VM directory
         shell: bash
         run: |
           set -euo pipefail
-          export VM_DIR="$RUNNER_TEMP/cst-debian-vm"
+          VM_DIR="$RUNNER_TEMP/cst-debian-vm"
           echo "VM_DIR=$VM_DIR" >> "$GITHUB_ENV"
           rm -rf "$VM_DIR"
           mkdir -p "$VM_DIR/seed"
-          echo "VM directory: $VM_DIR"
 
-      - name: 2. Check EasyTier secrets
+      - name: Check EasyTier secrets
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "${EASYTIER_NETWORK_NAME:-}" ]]; then
-            echo 'ERROR: EASYTIER_NETWORK_NAME is missing.'
-            exit 1
-          fi
-          if [[ -z "${EASYTIER_NETWORK_SECRET:-}" ]]; then
-            echo 'ERROR: EASYTIER_NETWORK_SECRET is missing.'
-            exit 1
-          fi
-          echo 'EasyTier repository secrets are present.'
+          test -n "${EASYTIER_NETWORK_NAME:-}" || { echo 'Missing EASYTIER_NETWORK_NAME'; exit 1; }
+          test -n "${EASYTIER_NETWORK_SECRET:-}" || { echo 'Missing EASYTIER_NETWORK_SECRET'; exit 1; }
 
-      - name: 3. Install QEMU/KVM and cloud-init tools
+      - name: Install QEMU and tools
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 qemu-utils qemu-kvm cloud-image-utils openssh-client sshpass curl unzip netcat-openbsd
-          qemu-system-x86_64 --version | head -n1
-          qemu-img --version | head -n1
 
-      - name: 4. Verify KVM acceleration
+      - name: Check KVM
         shell: bash
         run: |
           set -euo pipefail
-          if [[ ! -e /dev/kvm ]]; then
-            echo 'ERROR: /dev/kvm is not available on this GitHub-hosted runner.'
-            exit 1
-          fi
+          test -e /dev/kvm || { echo '/dev/kvm is unavailable'; exit 1; }
           sudo chmod 666 /dev/kvm || true
-          if ! qemu-system-x86_64 -accel kvm -machine q35,accel=kvm -nodefaults -nographic -S -display none >/dev/null 2>&1 & then
-            echo 'ERROR: QEMU cannot initialize KVM.'
-            exit 1
-          fi
-          QEMU_TEST_PID=$!
-          sleep 1
-          kill "$QEMU_TEST_PID" 2>/dev/null || true
-          wait "$QEMU_TEST_PID" 2>/dev/null || true
-          echo 'QEMU/KVM acceleration is available.'
+          timeout 5 qemu-system-x86_64 -accel kvm -machine q35 -nodefaults -nographic -S -display none
+          test "${PIPESTATUS[0]}" -eq 124 || true
+          echo 'KVM is available.'
 
-      - name: 5. Download latest Debian 13 cloud image
+      - name: Download Debian 13 latest image
         shell: bash
         run: |
           set -euo pipefail
           curl -fL --retry 5 --retry-delay 3 -o "$VM_DIR/debian.qcow2" "$DEBIAN_IMAGE_URL"
           test -s "$VM_DIR/debian.qcow2"
-          qemu-img info "$VM_DIR/debian.qcow2"
           qemu-img resize "$VM_DIR/debian.qcow2" 20G
 
-      - name: 6. Build Debian cloud-init seed
+      - name: Create cloud-init seed
         shell: bash
         run: |
           set -euo pipefail
+
           PASSWORD="${DEBIAN_ROOT_PASSWORD:-CstDebian@2026!}"
           PEER="${EASYTIER_PEER:-tcp://public.easytier.cn:11010}"
 
-          python3 - "$VM_DIR/seed/user-data" "$EASYTIER_NETWORK_NAME" "$EASYTIER_NETWORK_SECRET" "$PEER" "$PASSWORD" <<'PY'
-          import sys
-          from pathlib import Path
+          NET_NAME_B64="$(printf '%s' "$EASYTIER_NETWORK_NAME" | base64 -w0)"
+          NET_SECRET_B64="$(printf '%s' "$EASYTIER_NETWORK_SECRET" | base64 -w0)"
+          PEER_B64="$(printf '%s' "$PEER" | base64 -w0)"
+          PASSWORD_B64="$(printf '%s' "$PASSWORD" | base64 -w0)"
 
-          out, net_name, net_secret, peer, password = sys.argv[1:]
-          def sq(s):
-              return "'" + s.replace("'", "''") + "'"
+          cat > "$VM_DIR/seed/user-data" <<EOF
+#cloud-config
+hostname: cst-debian
+manage_etc_hosts: true
+ssh_pwauth: true
+disable_root: false
+chpasswd:
+  expire: false
+  users:
+    - name: root
+      password: ${PASSWORD_B64}
+      type: text
+package_update: true
+package_upgrade: true
+packages:
+  - ca-certificates
+  - curl
+  - wget
+  - unzip
+  - openssh-server
+  - iproute2
+  - iputils-ping
+  - procps
+  - net-tools
+  - sudo
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-cst.conf
+    permissions: '0600'
+    owner: root:root
+    content: |
+      PermitRootLogin yes
+      PasswordAuthentication yes
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+  - path: /opt/install-easytier.sh
+    permissions: '0700'
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      mkdir -p /opt/easytier /var/log/easytier
+      NET_NAME="\$(printf '%s' '${NET_NAME_B64}' | base64 -d)"
+      NET_SECRET="\$(printf '%s' '${NET_SECRET_B64}' | base64 -d)"
+      PEER="\$(printf '%s' '${PEER_B64}' | base64 -d)"
+      LATEST="\$(curl -fsSL https://api.github.com/repos/EasyTier/EasyTier/releases/latest | sed -n 's/.*"tag_name": "\([^"]*\)".*/\1/p' | head -n1)"
+      test -n "\$LATEST"
+      ASSET="easytier-linux-x86_64-\${LATEST}.zip"
+      curl -fL --retry 5 --retry-delay 2 -o /tmp/easytier.zip "https://github.com/EasyTier/EasyTier/releases/download/\${LATEST}/\${ASSET}"
+      rm -rf /tmp/easytier-extract
+      mkdir -p /tmp/easytier-extract
+      unzip -oq /tmp/easytier.zip -d /tmp/easytier-extract
+      CORE="\$(find /tmp/easytier-extract -type f -name easytier-core | head -n1)"
+      CLI="\$(find /tmp/easytier-extract -type f -name easytier-cli | head -n1)"
+      test -n "\$CORE" && test -n "\$CLI"
+      install -m 0755 "\$CORE" /opt/easytier/easytier-core
+      install -m 0755 "\$CLI" /opt/easytier/easytier-cli
+      cat > /opt/easytier/config.toml <<CONFIG
+      hostname = "CST-DEBIAN"
+      ipv4 = "10.1.1.52/24"
+      dhcp = false
+      rpc_portal = "127.0.0.1:15888"
+      listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010", "wg://0.0.0.0:11011"]
+      [network_identity]
+      network_name = "\$NET_NAME"
+      network_secret = "\$NET_SECRET"
+      [[peer]]
+      uri = "\$PEER"
+      [flags]
+      enable_encryption = true
+      multi_thread = true
+      latency_first = true
+      enable_exit_node = true
+      enable_ipv6 = false
+      CONFIG
+      chmod 0600 /opt/easytier/config.toml
+      cat > /etc/systemd/system/easytier.service <<SERVICE
+      [Unit]
+      Description=EasyTier Virtual Network
+      Wants=network-online.target
+      After=network-online.target
+      [Service]
+      Type=simple
+      ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml --file-log-dir /var/log/easytier --file-log-level info
+      Restart=always
+      RestartSec=3
+      LimitNOFILE=1048576
+      [Install]
+      WantedBy=multi-user.target
+      SERVICE
+      systemctl daemon-reload
+      systemctl enable --now easytier.service
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable --now ssh
+  - /opt/install-easytier.sh
+  - rm -f /opt/install-easytier.sh
+EOF
 
-          text = f'''#cloud-config
-          hostname: cst-debian
-          manage_etc_hosts: true
-          ssh_pwauth: true
-          disable_root: false
-          chpasswd:
-            expire: false
-            users:
-              - name: root
-                password: {sq(password)}
-                type: text
-          package_update: true
-          package_upgrade: true
-          packages:
-            - ca-certificates
-            - curl
-            - wget
-            - unzip
-            - openssh-server
-            - iproute2
-            - iputils-ping
-            - procps
-            - net-tools
-            - sudo
-          write_files:
-            - path: /etc/ssh/sshd_config.d/99-cst.conf
-              permissions: '0600'
-              owner: root:root
-              content: |
-                PermitRootLogin yes
-                PasswordAuthentication yes
-                KbdInteractiveAuthentication no
-                PubkeyAuthentication yes
-            - path: /opt/install-easytier.sh
-              permissions: '0700'
-              owner: root:root
-              content: |
-                #!/bin/bash
-                set -euo pipefail
-                mkdir -p /opt/easytier /var/log/easytier
-                latest="$(curl -fsSL https://api.github.com/repos/EasyTier/EasyTier/releases/latest | grep '"tag_name"' | head -n1 | sed -E 's/.*"([^\"]+)".*/\\1/')"
-                test -n "$latest"
-                case "$(uname -m)" in
-                  x86_64) et_arch='x86_64' ;;
-                  aarch64) et_arch='aarch64' ;;
-                  armv7l|armv7) et_arch='armv7' ;;
-                  *) echo 'Unsupported architecture' >&2; exit 1 ;;
-                esac
-                asset="easytier-linux-${{et_arch}}-${{latest}}.zip"
-                curl -fL --retry 5 --retry-delay 2 -o /tmp/easytier.zip "https://github.com/EasyTier/EasyTier/releases/download/${{latest}}/${{asset}}"
-                rm -rf /tmp/easytier-extract
-                mkdir -p /tmp/easytier-extract
-                unzip -oq /tmp/easytier.zip -d /tmp/easytier-extract
-                core="$(find /tmp/easytier-extract -type f -name easytier-core | head -n1)"
-                cli="$(find /tmp/easytier-extract -type f -name easytier-cli | head -n1)"
-                test -n "$core" && test -n "$cli"
-                install -m 0755 "$core" /opt/easytier/easytier-core
-                install -m 0755 "$cli" /opt/easytier/easytier-cli
-                cat > /opt/easytier/config.toml <<'CONFIG'
-                hostname = "CST-DEBIAN"
-                ipv4 = "10.1.1.52/24"
-                dhcp = false
-                rpc_portal = "127.0.0.1:15888"
-                listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010", "wg://0.0.0.0:11011"]
-                [network_identity]
-                network_name = {sq(net_name)}
-                network_secret = {sq(net_secret)}
-                [[peer]]
-                uri = {sq(peer)}
-                [flags]
-                enable_encryption = true
-                multi_thread = true
-                latency_first = true
-                enable_exit_node = true
-                enable_ipv6 = false
-                CONFIG
-                chmod 0600 /opt/easytier/config.toml
-                cat > /etc/systemd/system/easytier.service <<'SERVICE'
-                [Unit]
-                Description=EasyTier Virtual Network
-                Wants=network-online.target
-                After=network-online.target
-                [Service]
-                Type=simple
-                ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml --file-log-dir /var/log/easytier --file-log-level info
-                Restart=always
-                RestartSec=3
-                LimitNOFILE=1048576
-                [Install]
-                WantedBy=multi-user.target
-                SERVICE
-                systemctl daemon-reload
-                systemctl enable --now easytier.service
-          runcmd:
-            - systemctl daemon-reload
-            - systemctl enable --now ssh
-            - /opt/install-easytier.sh
-            - rm -f /opt/install-easytier.sh
-          '''
-          Path(out).write_text(text, encoding='utf-8')
-          Path(f'{Path(out).parent}/meta-data').write_text('instance-id: cst-debian\nlocal-hostname: cst-debian\n', encoding='utf-8')
-          Path(f'{Path(out).parent}/network-config').write_text('''version: 2
+          cat > "$VM_DIR/seed/meta-data" <<EOF
+instance-id: cst-debian
+local-hostname: cst-debian
+EOF
+
+          cat > "$VM_DIR/seed/network-config" <<EOF
+version: 2
 ethernets:
   ens3:
     dhcp4: true
-''', encoding='utf-8')
-          PY
+EOF
 
           cloud-localds --network-config="$VM_DIR/seed/network-config" "$VM_DIR/seed.iso" "$VM_DIR/seed/user-data" "$VM_DIR/seed/meta-data"
           chmod 600 "$VM_DIR/seed/user-data"
 
-      - name: 7. Boot Debian VM with QEMU/KVM
+      - name: Boot Debian VM
         shell: bash
         run: |
           set -euo pipefail
@@ -224,30 +198,32 @@ ethernets:
             -cpu host \
             -smp 2 \
             -m 4096 \
-            -drive file="$VM_DIR/debian.qcow2",if=virtio,format=qcow2,cache=writeback \
-            -drive file="$VM_DIR/seed.iso",media=cdrom,readonly=on \
-            -netdev user,id=net0,hostfwd=tcp:127.0.0.1:${VM_SSH_PORT}-:22 \
+            -drive "file=$VM_DIR/debian.qcow2,if=virtio,format=qcow2,cache=writeback" \
+            -drive "file=$VM_DIR/seed.iso,media=cdrom,readonly=on" \
+            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$VM_SSH_PORT-:22" \
             -device virtio-net-pci,netdev=net0 \
             -nographic \
-            -serial file="$VM_DIR/serial.log" \
+            -serial "file=$VM_DIR/serial.log" \
             >"$VM_DIR/qemu.log" 2>&1 &
           echo $! > "$VM_DIR/qemu.pid"
           sleep 5
-          kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null
-          echo 'Debian QEMU/KVM VM started.'
+          kill -0 "$(cat "$VM_DIR/qemu.pid")"
 
-      - name: 8. Wait for Debian and EasyTier
+      - name: Wait for Debian and EasyTier
         shell: bash
         run: |
           set -euo pipefail
-          SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ConnectionAttempts=2)
           PASSWORD="${DEBIAN_ROOT_PASSWORD:-CstDebian@2026!}"
+          SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ConnectionAttempts=2)
+
           for i in $(seq 1 90); do
-            if SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'echo SSH_OK' 2>/dev/null; then break; fi
+            if SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'echo SSH_OK' 2>/dev/null; then
+              break
+            fi
             if [[ "$i" -eq 90 ]]; then
-              echo 'ERROR: Debian SSH did not become ready.'
-              tail -n 160 "$VM_DIR/serial.log" 2>/dev/null || true
-              tail -n 160 "$VM_DIR/qemu.log" 2>/dev/null || true
+              echo 'Debian SSH did not become ready.'
+              tail -n 160 "$VM_DIR/serial.log" || true
+              tail -n 160 "$VM_DIR/qemu.log" || true
               exit 1
             fi
             sleep 4
@@ -255,26 +231,29 @@ ethernets:
 
           ET_IP=''
           for i in $(seq 1 60); do
-            out="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active easytier.service 2>/dev/null || true; /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true; ip -4 addr show 2>/dev/null' 2>/dev/null || true)"
-            echo "[$i/60] $out"
-            ET_IP="$(printf '%s\n' "$out" | sed -nE 's/.*(10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
-            if [[ -n "$ET_IP" ]]; then break; fi
+            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active easytier.service || true; ip -4 addr show || true' 2>/dev/null || true)"
+            echo "[$i/60] $OUT"
+            ET_IP="$(printf '%s\n' "$OUT" | sed -nE 's/.*inet (10\.[0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | head -n1)"
+            if [[ -n "$ET_IP" ]]; then
+              break
+            fi
             sleep 5
           done
-          if [[ -z "$ET_IP" ]]; then
-            echo 'ERROR: EasyTier virtual IP was not detected.'
-            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'journalctl -u easytier.service --no-pager -n 160 || true; cat /var/log/easytier/easytier-console.log 2>/dev/null || true'
+
+          test -n "$ET_IP" || {
+            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'journalctl -u easytier.service --no-pager -n 160 || true' || true
             exit 1
-          fi
+          }
+
           echo "EASYTIER_IP=$ET_IP" >> "$GITHUB_ENV"
           echo '=========================================='
-          echo ' DEBIAN 13 QEMU/KVM IS READY'
-          echo " EasyTier IP : $ET_IP"
-          echo ' SSH user    : root'
-          echo ' SSH port    : 22'
+          echo 'DEBIAN 13 QEMU/KVM IS READY'
+          echo "EasyTier IP : $ET_IP"
+          echo 'SSH user    : root'
+          echo 'SSH port    : 22'
           echo '=========================================='
 
-      - name: 9. Keep Debian + EasyTier alive
+      - name: Keep Debian and EasyTier alive
         shell: bash
         run: |
           set -euo pipefail
@@ -283,12 +262,9 @@ ethernets:
           for i in $(seq 1 360); do
             if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
               echo 'QEMU process stopped.'
-              tail -n 120 "$VM_DIR/qemu.log" 2>/dev/null || true
+              tail -n 120 "$VM_DIR/qemu.log" || true
               exit 1
             fi
-            if ! SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl is-active --quiet easytier.service'; then
-              echo 'EasyTier stopped; systemd will restart it.'
-            fi
-            echo "[$i/360] Debian VM + EasyTier running; EasyTier IP=${EASYTIER_IP}"
+            echo "[$i/360] Debian VM + EasyTier running; EasyTier IP=$EASYTIER_IP"
             sleep 60
           done
