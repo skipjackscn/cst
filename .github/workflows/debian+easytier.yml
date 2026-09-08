@@ -101,6 +101,7 @@ jobs:
             "ET_PEER_B64=$(printf '%s' "$PEER" | base64 -w0)" \
             "ROOT_PASSWORD_B64=$(printf '%s' "$ROOT_PASSWORD" | base64 -w0)")"
           ET_ENV_B64="$(printf '%s' "$ET_ENV" | base64 -w0)"
+          export ET_ENV_B64
           cp scripts/debian-cloud-init.yml "$VM_DIR/seed/user-data"
           python3 - <<'PY'
           import os
@@ -174,7 +175,7 @@ jobs:
 
           ET_IP=''
           for i in $(seq 1 60); do
-            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'printf "cloud-init="; cloud-init status 2>/dev/null || true; printf " easytier="; systemctl is-active easytier.service 2>/dev/null || true; printf "\n"; ip -4 addr show; if systemctl is-active --quiet easytier.service 2>/dev/null; then /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true; fi' 2>&1 || true)"
+            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'printf "cloud-init="; cloud-init status 2>/dev/null || true; printf " easytier="; systemctl is-active easytier.service 2>/dev/null || true; printf "\\n"; ip -4 addr show; if systemctl is-active --quiet easytier.service 2>/dev/null; then /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true; fi' 2>&1 || true)"
             echo "===== readiness [$i/60] ====="
             echo "$OUT"
 
