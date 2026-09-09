@@ -1,15 +1,16 @@
 # GitHub Actions: Windows RDP over EasyTier
 # 放到 .github/workflows/winRDP+easytier.yml
 #
-# 从仓库 Settings - Secrets and variables - Actions 读取:
+# Secrets (Settings - Secrets and variables - Actions):
 #   EASYTIER_NETWORK_NAME     必填
 #   EASYTIER_NETWORK_SECRET   必填
-#   EASYTIER_PEER             可选，默认 tcp://public.easytier.cn:11010
+#   EASYTIER_PEER             可选。支持多个 -p，例如:
+#                             -p tcp://1.2.3.4:11010 -p udp://1.2.3.4:11010 -p tcp://example.com:11010
+#                             留空则用 tcp://public.easytier.cn:11010
 
 name: Windows Cloud RDP easytier
 
 on:
-  #- cron: '23 1 * * *'
   workflow_dispatch:
 
 jobs:
@@ -55,31 +56,113 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+          $installRoot = 'C:\EasyTier'
+          $logDir = 'C:\easytier-logs'
+          $zipPath = 'C:\easytier.zip'
+          $configPath = Join-Path $installRoot 'config.toml'
+          $stdOut = Join-Path $logDir 'stdout.log'
+          $stdErr = Join-Path $logDir 'stderr.log'
+          New-Item -ItemType Directory -Force -Path $installRoot, $logDir | Out-Null
+
+          function Dump-Logs {
+            Get-ChildItem $logDir -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host ('----- ' + $_.Name + ' size=' + $_.Length + ' -----')
+              if ($_.Length -gt 0) { Get-Content $_.FullName -ErrorAction SilentlyContinue } else { Write-Host '(empty)' }
+            }
+            if (Test-Path $configPath) {
+              Write-Host '----- config.toml (redacted) -----'
+              Get-Content $configPath | ForEach-Object {
+                if ($_ -match 'network_name|network_secret') { Write-Host (($_ -split '=', 2)[0] + '= ***') } else { Write-Host $_ }
+              }
+            }
+          }
+
           function Fail {
             param([string]$Msg)
             Write-Host $Msg -ForegroundColor Red
-            if (Test-Path 'C:\easytier-logs') {
-              Get-ChildItem 'C:\easytier-logs' -File -ErrorAction SilentlyContinue | ForEach-Object {
-                Write-Host ('----- ' + $_.Name + ' -----')
-                Get-Content $_.FullName -Tail 80 -ErrorAction SilentlyContinue
-              }
-            }
+            Dump-Logs
             exit 1
           }
 
-          $netName = ([string]$env:EASYTIER_NETWORK_NAME).Trim()
-          $netSecret = ([string]$env:EASYTIER_NETWORK_SECRET).Trim()
-          $peer = ([string]$env:EASYTIER_PEER).Trim()
-          if ([string]::IsNullOrWhiteSpace($peer)) { $peer = 'tcp://public.easytier.cn:11010' }
+          function Strip-Wrap {
+            param([string]$s)
+            if ($null -eq $s) { return '' }
+            $s = $s.Trim()
+            if ($s.Length -ge 2) {
+              $a = $s[0]; $b = $s[$s.Length - 1]
+              if (($a -eq '"' -and $b -eq '"') -or ($a -eq [char]39 -and $b -eq [char]39)) {
+                $s = $s.Substring(1, $s.Length - 2).Trim()
+              }
+            }
+            return $s
+          }
+
+          function Parse-Peers {
+            param([string]$raw)
+            $raw = Strip-Wrap $raw
+            $list = New-Object System.Collections.Generic.List[string]
+            $seen = @{}
+            $rx = [regex]'(?i)(?:tcp|udp|ws|wss|wg|quic)://[^\s,;]+'
+            foreach ($m in $rx.Matches($raw)) {
+              $u = $m.Value.Trim().TrimEnd('/').TrimEnd(',')
+              if ($u -notmatch ':\d+$') { $u = $u + ':11010' }
+              if (-not $seen.ContainsKey($u)) { [void]$list.Add($u); $seen[$u] = $true }
+            }
+            return $list
+          }
+
+          function EscToml {
+            param([string]$s)
+            return $s.Replace('\', '\\').Replace('"', '\"')
+          }
+
+          function Write-EtConfig {
+            param([string[]]$PeerList, [string]$Name, [string]$Secret)
+            $toml = New-Object System.Collections.Generic.List[string]
+            [void]$toml.Add('hostname = "github-rdp-server"')
+            [void]$toml.Add('dhcp = true')
+            [void]$toml.Add('rpc_portal = "127.0.0.1:15888"')
+            [void]$toml.Add('listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"]')
+            [void]$toml.Add('')
+            [void]$toml.Add('[network_identity]')
+            [void]$toml.Add(('network_name = "' + (EscToml $Name) + '"'))
+            [void]$toml.Add(('network_secret = "' + (EscToml $Secret) + '"'))
+            [void]$toml.Add('')
+            foreach ($u in $PeerList) {
+              [void]$toml.Add('[[peer]]')
+              [void]$toml.Add(('uri = "' + (EscToml $u) + '"'))
+              [void]$toml.Add('')
+            }
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            [System.IO.File]::WriteAllLines($configPath, $toml.ToArray(), $utf8NoBom)
+          }
+
+          function Start-Et {
+            foreach ($f in @($stdOut, $stdErr)) { if (Test-Path $f) { Remove-Item $f -Force } }
+            Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            $etArgs = @('--config-file', $configPath, '--file-log-dir', $logDir, '--file-log-level', 'info')
+            $p = Start-Process -FilePath $easytierPath -WorkingDirectory $installRoot -ArgumentList $etArgs -RedirectStandardOutput $stdOut -RedirectStandardError $stdErr -PassThru
+            Start-Sleep -Seconds 4
+            return $p
+          }
+
+          $netName = Strip-Wrap ([string]$env:EASYTIER_NETWORK_NAME)
+          $netSecret = Strip-Wrap ([string]$env:EASYTIER_NETWORK_SECRET)
+          $peerRaw = Strip-Wrap ([string]$env:EASYTIER_PEER)
+          Write-Host ('secret name len=' + $netName.Length + ' secret len=' + $netSecret.Length + ' peer raw len=' + $peerRaw.Length)
 
           if ([string]::IsNullOrWhiteSpace($netName) -or [string]::IsNullOrWhiteSpace($netSecret)) {
             Fail 'Missing EASYTIER_NETWORK_NAME or EASYTIER_NETWORK_SECRET in repository secrets.'
           }
 
-          $installRoot = 'C:\EasyTier'
-          $logDir = 'C:\easytier-logs'
-          $zipPath = 'C:\easytier.zip'
-          New-Item -ItemType Directory -Force -Path $installRoot, $logDir | Out-Null
+          $peerList = Parse-Peers $peerRaw
+          if ($peerList.Count -eq 0) {
+            [void]$peerList.Add('tcp://public.easytier.cn:11010')
+            Write-Host 'EASYTIER_PEER empty or invalid, using public node'
+          }
+          Write-Host ('parsed peer count=' + $peerList.Count)
+          foreach ($u in $peerList) { Write-Host ('  peer len=' + $u.Length + ' proto=' + (($u -split '://')[0])) }
 
           $version = 'v2.6.4'
           $downloadUrl = 'https://github.com/EasyTier/EasyTier/releases/download/' + $version + '/easytier-windows-x86_64-' + $version + '.zip'
@@ -88,9 +171,7 @@ jobs:
           try {
             & curl.exe -L --fail --retry 3 --retry-delay 2 -o $zipPath $downloadUrl
             if (($LASTEXITCODE -eq 0) -and (Test-Path $zipPath) -and ((Get-Item $zipPath).Length -gt 1MB)) { $curlOk = $true }
-          } catch {
-            $curlOk = $false
-          }
+          } catch { $curlOk = $false }
           if (-not $curlOk) {
             Write-Host 'curl failed, fallback to Invoke-WebRequest'
             Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -UseBasicParsing
@@ -102,7 +183,6 @@ jobs:
           $extractDir = 'C:\easytier-extract'
           if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
           Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-
           $coreItem = Get-ChildItem -Path $extractDir -Recurse -Filter 'easytier-core.exe' | Select-Object -First 1
           if (-not $coreItem) { Fail 'easytier-core.exe not found after extract' }
           Copy-Item -Path (Join-Path $coreItem.Directory.FullName '*') -Destination $installRoot -Recurse -Force
@@ -112,49 +192,23 @@ jobs:
           $cliPath = Join-Path $installRoot 'easytier-cli.exe'
           if (-not (Test-Path $easytierPath)) { Fail ('missing ' + $easytierPath) }
           if (-not (Test-Path $cliPath)) { Fail ('missing ' + $cliPath) }
-          $wintun = Join-Path $installRoot 'wintun.dll'
-          if (-not (Test-Path $wintun)) { Write-Host 'WARNING: wintun.dll not found' -ForegroundColor Yellow }
+          if (-not (Test-Path (Join-Path $installRoot 'wintun.dll'))) { Write-Host 'WARNING: wintun.dll not found' -ForegroundColor Yellow }
 
-          Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 1
+          $ErrorActionPreference = 'Continue'
+          $verOut = & $easytierPath --version 2>&1 | Out-String
+          $ErrorActionPreference = 'Stop'
+          $global:LASTEXITCODE = 0
+          Write-Host ('easytier version: ' + $verOut.Trim())
 
-          function EscToml {
-            param([string]$s)
-            return $s.Replace('\', '\\').Replace('"', '\"')
-          }
-
-          $toml = New-Object System.Collections.Generic.List[string]
-          [void]$toml.Add('hostname = "github-rdp-server"')
-          [void]$toml.Add('dhcp = true')
-          [void]$toml.Add('rpc_portal = "127.0.0.1:15888"')
-          [void]$toml.Add('listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010", "wg://0.0.0.0:11011"]')
-          [void]$toml.Add('')
-          [void]$toml.Add('[network_identity]')
-          [void]$toml.Add(('network_name = "' + (EscToml $netName) + '"'))
-          [void]$toml.Add(('network_secret = "' + (EscToml $netSecret) + '"'))
-          [void]$toml.Add('')
-          [void]$toml.Add('[[peer]]')
-          [void]$toml.Add(('uri = "' + (EscToml $peer) + '"'))
-          [void]$toml.Add('')
-          [void]$toml.Add('[flags]')
-          [void]$toml.Add('enable_encryption = true')
-          [void]$toml.Add('multi_thread = true')
-          [void]$toml.Add('latency_first = true')
-          [void]$toml.Add('enable_ipv6 = false')
-
-          $configPath = Join-Path $installRoot 'config.toml'
-          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-          [System.IO.File]::WriteAllLines($configPath, $toml.ToArray(), $utf8NoBom)
+          Write-EtConfig -PeerList $peerList.ToArray() -Name $netName -Secret $netSecret
           Write-Host ('Wrote ' + $configPath)
-          Write-Host ('peer = ' + $peer)
-
-          $argLine = '--config-file ' + $configPath + ' --file-log-dir ' + $logDir + ' --file-log-level info'
-          $proc = Start-Process -FilePath $easytierPath -WorkingDirectory $installRoot -ArgumentList $argLine -WindowStyle Hidden -PassThru
-          Start-Sleep -Seconds 2
-          if (-not (Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue)) {
-            Fail 'easytier-core exited immediately. Check C:\easytier-logs'
+          $proc = Start-Et
+          if ($proc.HasExited -or -not (Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue)) {
+            $code = 'n/a'
+            try { $code = [string]$proc.ExitCode } catch {}
+            Fail ('easytier-core exited immediately, exit=' + $code)
           }
-          Write-Host ('easytier-core pid=' + (Get-Process -Name 'easytier-core' | Select-Object -First 1 -ExpandProperty Id))
+          Write-Host ('easytier-core pid=' + $proc.Id)
 
           $etIp = $null
           for ($i = 1; $i -le 40; $i++) {
@@ -169,19 +223,13 @@ jobs:
             $global:LASTEXITCODE = 0
             Write-Host ('[' + $i + '/40] node output:')
             Write-Host $nodeOut
-            if (($i -eq 1) -or (($i % 5) -eq 0)) {
-              Write-Host 'peer output:'
-              Write-Host $peerOut
-            }
+            if (($i -eq 1) -or (($i % 5) -eq 0)) { Write-Host 'peer output:'; Write-Host $peerOut }
             if ($nodeOut -match 'Virtual IP\s*\|\s*(\d{1,3}(?:\.\d{1,3}){3})') {
               $cand = $Matches[1]
               if ($cand -ne '0.0.0.0') { $etIp = $cand; break }
             }
             if (-not $etIp) {
-              if ($peerOut -match '(\d{1,3}(?:\.\d{1,3}){3})\s*\|\s*github-rdp-server') {
-                $etIp = $Matches[1]
-                break
-              }
+              if ($peerOut -match '(\d{1,3}(?:\.\d{1,3}){3})\s*\|\s*github-rdp-server') { $etIp = $Matches[1]; break }
             }
             $tunIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
               Where-Object { $_.IPAddress -like '10.*' -and $_.InterfaceAlias -match 'easytier|et_|tun|Wintun' } |
@@ -189,9 +237,7 @@ jobs:
             if ($tunIp) { $etIp = $tunIp; break }
           }
 
-          if (-not $etIp) {
-            Fail 'Timed out waiting for EasyTier virtual IP. Use the same network name/secret and shared node on your PC.'
-          }
+          if (-not $etIp) { Fail 'Timed out waiting for EasyTier virtual IP. Check peers and network name/secret.' }
 
           Write-Host ''
           Write-Host '==========================================' -ForegroundColor Green
@@ -201,7 +247,6 @@ jobs:
           Write-Host '  Password     : P@ssw0rd1qazXSW@#' -ForegroundColor Yellow
           Write-Host ('  mstsc target : ' + $etIp) -ForegroundColor Magenta
           Write-Host '==========================================' -ForegroundColor Green
-
           $global:LASTEXITCODE = 0
           exit 0
 
@@ -214,12 +259,14 @@ jobs:
           $easytierPath = Join-Path $installRoot 'easytier-core.exe'
           $configPath = Join-Path $installRoot 'config.toml'
           $logDir = 'C:\easytier-logs'
-          $argLine = '--config-file ' + $configPath + ' --file-log-dir ' + $logDir + ' --file-log-level info'
+          $etArgs = @('--config-file', $configPath, '--file-log-dir', $logDir, '--file-log-level', 'info')
           for ($i = 1; $i -le 360; $i++) {
             $alive = Get-Process -Name 'easytier-core' -ErrorAction SilentlyContinue
             if (-not $alive) {
               Write-Host ('[' + $i + '/360] easytier-core stopped, restarting') -ForegroundColor Yellow
-              Start-Process -FilePath $easytierPath -WorkingDirectory $installRoot -ArgumentList $argLine -WindowStyle Hidden | Out-Null
+              $so = Join-Path $logDir ('stdout-r' + $i + '.log')
+              $se = Join-Path $logDir ('stderr-r' + $i + '.log')
+              Start-Process -FilePath $easytierPath -WorkingDirectory $installRoot -ArgumentList $etArgs -RedirectStandardOutput $so -RedirectStandardError $se | Out-Null
             } else {
               Write-Host ('[' + $i + '/360] Server running, pid=' + $alive.Id)
             }
