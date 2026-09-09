@@ -1,243 +1,206 @@
-name: Debian 13 QEMU KVM EasyTier
+# GitHub Actions: Debian SSH over EasyTier
+# 放到 .github/workflows/debian+easytier.yml
+#
+# Secrets (Settings - Secrets and variables - Actions):
+#   EASYTIER_NETWORK_NAME     必填
+#   EASYTIER_NETWORK_SECRET   必填
+#   EASYTIER_PEER             可选。支持多个 -p，例如:
+#                             -p tcp://1.2.3.4:11010 -p udp://1.2.3.4:11010 -p tcp://example.com:11010
+#                             留空则用 tcp://public.easytier.cn:11010
+#
+# 连接: ssh NvdAdmin@<EasyTier IP>
+# 密码: P@ssw0rd1qazXSW@#
+
+name: Debian SSH easytier
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.github/workflows/debian+easytier.yml'
-      - 'scripts/debian-cloud-init.yml'
-      - 'scripts/debian-easytier-bootstrap.sh'
-
-permissions:
-  contents: read
 
 jobs:
-  debian-vm:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      VM_NAME: cst-debian
-      VM_SSH_PORT: '22222'
-      DEBIAN_IMAGE_URL: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
-      EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
-      EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
-      EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
-      DEBIAN_ROOT_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+    container:
+      image: debian:bookworm
+      options: --privileged --cap-add=NET_ADMIN
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Check required secrets
+      - name: 1. Install SSH and base packages
         shell: bash
         run: |
           set -euo pipefail
-          test -n "$EASYTIER_NETWORK_NAME" || { echo 'Missing EASYTIER_NETWORK_NAME'; exit 1; }
-          test -n "$EASYTIER_NETWORK_SECRET" || { echo 'Missing EASYTIER_NETWORK_SECRET'; exit 1; }
-          test -n "$DEBIAN_ROOT_PASSWORD" || { echo 'Missing DEBIAN_ROOT_PASSWORD'; exit 1; }
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends openssh-server sudo curl ca-certificates unzip iproute2 procps iptables openssl
+          mkdir -p /run/sshd /dev/net
+          if [ ! -c /dev/net/tun ]; then mknod /dev/net/tun c 10 200; chmod 666 /dev/net/tun; fi
+          ssh-keygen -A
+          printf '%s\n' 'PasswordAuthentication yes' 'PermitRootLogin yes' 'UseDNS no' 'ClientAliveInterval 30' 'ClientAliveCountMax 120' >> /etc/ssh/sshd_config
+          echo 'root:P@ssw0rd1qazXSW@#' | chpasswd
+          id NvdAdmin >/dev/null 2>&1 || useradd -m -s /bin/bash NvdAdmin
+          echo 'NvdAdmin:P@ssw0rd1qazXSW@#' | chpasswd
+          usermod -aG sudo NvdAdmin
+          echo 'NvdAdmin ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/NvdAdmin
+          chmod 440 /etc/sudoers.d/NvdAdmin
+          /usr/sbin/sshd
+          echo 'SSH ready.'
 
-      - name: Prepare VM directory
-        shell: bash
-        run: |
-          set -euo pipefail
-          VM_DIR="$RUNNER_TEMP/cst-debian-vm"
-          echo "VM_DIR=$VM_DIR" >> "$GITHUB_ENV"
-          rm -rf "$VM_DIR"
-          mkdir -p "$VM_DIR/seed"
-
-      - name: Install QEMU and cloud-init tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 qemu-utils qemu-kvm cloud-image-utils openssh-client sshpass curl
-          qemu-system-x86_64 --version | head -n1
-
-      - name: Select QEMU acceleration
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -e /dev/kvm ]]; then
-            sudo chmod 666 /dev/kvm || true
-            set +e
-            timeout 5s qemu-system-x86_64 -accel kvm -machine q35 -nodefaults -nographic -S -display none
-            rc=$?
-            set -e
-            if [[ $rc -eq 124 ]]; then
-              echo 'KVM acceleration available.'
-              echo 'QEMU_ACCEL=-accel kvm' >> "$GITHUB_ENV"
-              echo 'QEMU_CPU=-cpu host' >> "$GITHUB_ENV"
-              exit 0
-            fi
-            echo "KVM self-test failed with exit code $rc; using TCG."
-          else
-            echo 'KVM device unavailable; using TCG.'
-          fi
-          echo 'QEMU_ACCEL=-accel tcg,thread=multi' >> "$GITHUB_ENV"
-          echo 'QEMU_CPU=-cpu max' >> "$GITHUB_ENV"
-
-      - name: Download Debian 13 stable cloud image
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fL --retry 5 --retry-delay 3 -o "$VM_DIR/debian.qcow2" "$DEBIAN_IMAGE_URL"
-          test -s "$VM_DIR/debian.qcow2"
-          qemu-img info "$VM_DIR/debian.qcow2"
-          qemu-img resize "$VM_DIR/debian.qcow2" 20G
-
-      - name: Render cloud-init seed
+      - name: 2. Install and Connect EasyTier
         shell: bash
         env:
-          ET_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
-          ET_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
-          ET_PEER: ${{ secrets.EASYTIER_PEER }}
-          ROOT_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+          EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
+          EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
+          EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
         run: |
-          set -euo pipefail
-          PEER="${ET_PEER:-tcp://public.easytier.cn:11010}"
-          ET_ENV="$(printf '%s\n' \
-            "ET_NAME_B64=$(printf '%s' "$ET_NAME" | base64 -w0)" \
-            "ET_SECRET_B64=$(printf '%s' "$ET_SECRET" | base64 -w0)" \
-            "ET_PEER_B64=$(printf '%s' "$PEER" | base64 -w0)" \
-            "ROOT_PASSWORD_B64=$(printf '%s' "$ROOT_PASSWORD" | base64 -w0)")"
-          ET_ENV_B64="$(printf '%s' "$ET_ENV" | base64 -w0)"
-          export ET_ENV_B64
-          cp scripts/debian-cloud-init.yml "$VM_DIR/seed/user-data"
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          p = Path(os.environ['VM_DIR']) / 'seed' / 'user-data'
-          s = p.read_text()
-          s = s.replace('__EASYTIER_ENV_B64__', os.environ['ET_ENV_B64'])
-          s = s.replace('__ROOT_PASSWORD__', os.environ['ROOT_PASSWORD'])
-          p.write_text(s)
-          PY
-          printf '%s\n' 'instance-id: cst-debian' 'local-hostname: cst-debian' > "$VM_DIR/seed/meta-data"
-          printf '%s\n' 'version: 2' 'ethernets:' '  ens3:' '    dhcp4: true' > "$VM_DIR/seed/network-config"
-          cloud-localds --network-config="$VM_DIR/seed/network-config" "$VM_DIR/seed.iso" "$VM_DIR/seed/user-data" "$VM_DIR/seed/meta-data"
-          chmod 600 "$VM_DIR/seed/user-data"
+          set -uo pipefail
+          install_root=/opt/easytier
+          log_dir=/var/log/easytier
+          config_path=$install_root/config.toml
+          mkdir -p "$install_root" "$log_dir"
 
-      - name: Boot Debian VM
-        shell: bash
-        run: |
-          set -euo pipefail
-          nohup qemu-system-x86_64 \
-            -name "$VM_NAME" \
-            -machine q35 \
-            $QEMU_ACCEL \
-            $QEMU_CPU \
-            -smp 2 \
-            -m 4096 \
-            -drive "file=$VM_DIR/debian.qcow2,if=virtio,format=qcow2,cache=writeback" \
-            -drive "file=$VM_DIR/seed.iso,media=cdrom,readonly=on" \
-            -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$VM_SSH_PORT-:22" \
-            -device virtio-net-pci,netdev=net0 \
-            -nographic \
-            -serial "file:$VM_DIR/serial.log" \
-            >"$VM_DIR/qemu.log" 2>&1 &
-          QEMU_PID=$!
-          echo "$QEMU_PID" > "$VM_DIR/qemu.pid"
-          sleep 5
-          if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            echo 'ERROR: QEMU exited during startup.'
-            tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
-            exit 1
-          fi
-          echo 'Debian VM started.'
-
-      - name: Wait for Debian and EasyTier
-        shell: bash
-        run: |
-          set -euo pipefail
-          PASSWORD="$DEBIAN_ROOT_PASSWORD"
-          SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o ConnectionAttempts=2)
-
-          echo 'Waiting for SSH...'
-          for i in $(seq 1 60); do
-            if SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'echo SSH_OK' >/dev/null 2>&1; then
-              echo "Debian SSH is ready after $((i*2))s."
-              break
+          dump_logs() {
+            echo '----- logs -----'
+            ls -l "$log_dir" 2>/dev/null || true
+            for f in "$log_dir"/*; do
+              [ -f "$f" ] || continue
+              echo "----- $f -----"
+              tail -n 80 "$f" || true
+            done
+            if [ -f "$config_path" ]; then
+              echo '----- config.toml (redacted) -----'
+              sed -E 's/(network_name|network_secret) *=.*/\1 = ***/' "$config_path" || true
             fi
-            if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
-              echo 'ERROR: QEMU stopped before SSH became available.'
-              tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
-              tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
-              exit 1
-            fi
-            if [[ "$i" -eq 60 ]]; then
-              echo 'ERROR: Debian SSH timeout.'
-              tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
-              tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
-              exit 1
-            fi
-            sleep 2
-          done
+          }
 
-          ET_IP=''
-          for i in $(seq 1 60); do
-            OUT="$(SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'printf "cloud-init="; cloud-init status 2>/dev/null || true; printf " easytier="; systemctl is-active easytier.service 2>/dev/null || true; printf "\\n"; ip -4 addr show; if systemctl is-active --quiet easytier.service 2>/dev/null; then /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node 2>&1 || true; fi' 2>&1 || true)"
-            echo "===== readiness [$i/60] ====="
-            echo "$OUT"
+          fail() { echo "$1" >&2; dump_logs; exit 1; }
 
-            if printf '%s\n' "$OUT" | grep -q '10\.1\.1\.52/'; then
-              ET_IP='10.1.1.52'
-            else
-              ET_IP=''
-            fi
+          strip_wrap() {
+            s=$1
+            s=${s#"${s%%[![:space:]]*}"}
+            s=${s%"${s##*[![:space:]]}"}
+            case "$s" in
+              \"*\") s=${s#\"}; s=${s%\"} ;;
+              \'*\') s=${s#\'}; s=${s%\'} ;;
+            esac
+            printf '%s' "$s"
+          }
 
-            if printf '%s\n' "$OUT" | grep -q '^cloud-init=error'; then
-              echo 'ERROR: cloud-init reported error.'
-              SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'tail -n 200 /var/log/cloud-init-output.log || true; tail -n 100 /var/log/cloud-init.log || true' || true
-              exit 1
-            fi
+          escape_toml() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-            if printf '%s\n' "$OUT" | grep -q 'easytier=failed'; then
-              echo 'EasyTier service failed; printing journal.'
-              SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true' || true
-              exit 1
-            fi
-
-            if [[ "$ET_IP" == '10.1.1.52' ]]; then
-              break
-            fi
-            sleep 5
-          done
-
-          if [[ "$ET_IP" != '10.1.1.52' ]]; then
-            echo 'ERROR: EasyTier 10.1.1.52 was not detected.'
-            SSHPASS="$PASSWORD" sshpass -e ssh "${SSH_OPTS[@]}" -p "$VM_SSH_PORT" root@127.0.0.1 'systemctl status easytier.service --no-pager || true; journalctl -u easytier.service --no-pager -n 200 || true; ip -4 addr show || true' || true
-            exit 1
+          net_name=$(strip_wrap "${EASYTIER_NETWORK_NAME:-}")
+          net_secret=$(strip_wrap "${EASYTIER_NETWORK_SECRET:-}")
+          peer_raw=$(strip_wrap "${EASYTIER_PEER:-}")
+          echo "secret name len=${#net_name} secret len=${#net_secret} peer raw len=${#peer_raw}"
+          if [ -z "$net_name" ] || [ -z "$net_secret" ]; then
+            fail 'Missing EASYTIER_NETWORK_NAME or EASYTIER_NETWORK_SECRET in repository secrets.'
           fi
 
-          echo "EASYTIER_IP=$ET_IP" >> "$GITHUB_ENV"
+          peer_list=()
+          while IFS= read -r u; do
+            [ -n "$u" ] || continue
+            u=${u%/}
+            case "$u" in
+              *:[0-9]|*:[0-9][0-9]|*:[0-9][0-9][0-9]|*:[0-9][0-9][0-9][0-9]|*:[0-9][0-9][0-9][0-9][0-9]) ;;
+              *) u="${u}:11010" ;;
+            esac
+            peer_list+=("$u")
+          done < <(printf '%s\n' "$peer_raw" | grep -oE '(tcp|udp|ws|wss|wg|quic)://[^[:space:],;]+' || true)
+
+          if [ ${#peer_list[@]} -eq 0 ]; then
+            peer_list=('tcp://public.easytier.cn:11010')
+            echo 'EASYTIER_PEER empty or invalid, using public node'
+          fi
+          echo "parsed peer count=${#peer_list[@]}"
+          for u in "${peer_list[@]}"; do echo "  peer len=${#u}"; done
+
+          version=v2.6.4
+          zip_path=/tmp/easytier.zip
+          url="https://github.com/EasyTier/EasyTier/releases/download/${version}/easytier-linux-x86_64-${version}.zip"
+          echo "Downloading EasyTier ${version}"
+          curl -L --fail --retry 3 --retry-delay 2 -o "$zip_path" "$url"
+          sz=$(stat -c%s "$zip_path")
+          if [ "$sz" -lt 1000000 ]; then fail "Download too small: $sz"; fi
+          extract_dir=/tmp/easytier-extract
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          unzip -o "$zip_path" -d "$extract_dir"
+          core=$(find "$extract_dir" -type f -name easytier-core | head -n1)
+          [ -n "$core" ] || fail 'easytier-core not found after extract'
+          cp -a "$(dirname "$core")/." "$install_root/"
+          chmod +x "$install_root/easytier-core" "$install_root/easytier-cli"
+          "$install_root/easytier-core" --version || true
+
+          {
+            echo 'hostname = "github-debian-server"'
+            echo 'dhcp = true'
+            echo 'rpc_portal = "127.0.0.1:15888"'
+            echo 'listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010"]'
+            echo
+            echo '[network_identity]'
+            printf 'network_name = "%s"\n' "$(escape_toml "$net_name")"
+            printf 'network_secret = "%s"\n' "$(escape_toml "$net_secret")"
+            echo
+            for u in "${peer_list[@]}"; do
+              echo '[[peer]]'
+              printf 'uri = "%s"\n' "$(escape_toml "$u")"
+              echo
+            done
+          } > "$config_path"
+          echo "Wrote $config_path"
+
+          start_et() {
+            pkill -9 easytier-core 2>/dev/null || true
+            sleep 1
+            : > "$log_dir/stdout.log"
+            : > "$log_dir/stderr.log"
+            nohup "$install_root/easytier-core" --config-file "$config_path" --file-log-dir "$log_dir" --file-log-level info >"$log_dir/stdout.log" 2>"$log_dir/stderr.log" &
+            echo $! > /var/run/easytier.pid
+            sleep 4
+          }
+
+          start_et
+          pgrep -x easytier-core >/dev/null || fail 'easytier-core exited immediately'
+
+          et_ip=
+          for i in $(seq 1 40); do
+            sleep 3
+            pgrep -x easytier-core >/dev/null || fail "easytier-core died while waiting for IP, round $i"
+            node_out=$("$install_root/easytier-cli" --rpc-portal 127.0.0.1:15888 node 2>&1 || true)
+            peer_out=$("$install_root/easytier-cli" --rpc-portal 127.0.0.1:15888 peer 2>&1 || true)
+            echo "[$i/40] node output:"
+            echo "$node_out"
+            if [ "$i" -eq 1 ] || [ $((i % 5)) -eq 0 ]; then echo "peer output:"; echo "$peer_out"; fi
+            cand=$(printf '%s\n' "$node_out" | sed -n 's/.*Virtual IP[[:space:]]*|[[:space:]]*\([0-9.]*\).*/\1/p' | head -n1)
+            if [ -n "$cand" ] && [ "$cand" != "0.0.0.0" ]; then et_ip=$cand; break; fi
+            cand=$(printf '%s\n' "$peer_out" | sed -n 's/.*\([0-9]\+\.[0-9]\+\.[0-9]\+\.[0-9]\+\)[[:space:]]*|[[:space:]]*github-debian-server.*/\1/p' | head -n1)
+            if [ -n "$cand" ]; then et_ip=$cand; break; fi
+            cand=$(ip -4 -o addr show 2>/dev/null | awk '/ tun| easytier| et_/ {print $4}' | cut -d/ -f1 | awk '/^10\./{print; exit}')
+            if [ -n "$cand" ]; then et_ip=$cand; break; fi
+          done
+          [ -n "$et_ip" ] || fail 'Timed out waiting for EasyTier virtual IP. Check peers and network name/secret.'
+
+          echo
           echo '=========================================='
-          echo 'DEBIAN 13 QEMU/KVM + EASYTIER READY'
-          echo "EasyTier IP : $ET_IP"
-          echo 'SSH user    : root'
-          echo 'VM SSH port : 22222 on runner'
+          echo '  DEBIAN SSH SERVER IS READY'
+          echo "  EasyTier IP  : $et_ip"
+          echo '  Username     : NvdAdmin'
+          echo '  Password     : P@ssw0rd1qazXSW@#'
+          echo "  ssh command  : ssh NvdAdmin@$et_ip"
           echo '=========================================='
 
-      - name: Keep VM alive
+      - name: 3. Keep Server Alive
         shell: bash
         run: |
-          set -euo pipefail
+          install_root=/opt/easytier
+          log_dir=/var/log/easytier
+          config_path=$install_root/config.toml
           for i in $(seq 1 360); do
-            if ! kill -0 "$(cat "$VM_DIR/qemu.pid")" 2>/dev/null; then
-              echo 'QEMU stopped unexpectedly.'
-              tail -n 200 "$VM_DIR/qemu.log" 2>/dev/null || true
-              tail -n 200 "$VM_DIR/serial.log" 2>/dev/null || true
-              exit 1
+            if ! pgrep -x easytier-core >/dev/null; then
+              echo "[$i/360] easytier-core stopped, restarting"
+              nohup "$install_root/easytier-core" --config-file "$config_path" --file-log-dir "$log_dir" --file-log-level info >>"$log_dir/stdout.log" 2>>"$log_dir/stderr.log" &
+            else
+              echo "[$i/360] Server running, pid=$(pgrep -x easytier-core | head -n1)"
             fi
-            echo "[$i/360] Debian VM running; EasyTier IP=$EASYTIER_IP"
+            if ! pgrep -x sshd >/dev/null; then echo 'sshd stopped, restarting'; /usr/sbin/sshd || true; fi
             sleep 60
           done
-
-      - name: Collect VM logs on failure
-        if: failure()
-        shell: bash
-        run: |
-          set +e
-          echo '===== qemu.log ====='
-          tail -n 300 "$VM_DIR/qemu.log" 2>/dev/null || true
-          echo '===== serial.log ====='
-          tail -n 300 "$VM_DIR/serial.log" 2>/dev/null || true
