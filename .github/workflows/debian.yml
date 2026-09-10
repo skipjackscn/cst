@@ -1,1 +1,161 @@
 
+name: Debian QEMU KVM EasyTier Server
+
+on:
+  workflow_dispatch:
+
+env:
+  VM_USER: NvdAdmin
+  VM_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+
+jobs:
+  debian-kvm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install QEMU/KVM tools
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            sshpass \
+            curl \
+            jq \
+            unzip
+
+          test -e /dev/kvm || {
+            echo "/dev/kvm unavailable"
+            exit 1
+          }
+
+      - name: Download Debian 13 image
+        run: |
+          mkdir -p vm
+          cd vm
+          curl -L --retry 5 \
+            -o debian.qcow2 \
+            https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          qemu-img resize debian.qcow2 20G
+
+      - name: Create cloud-init
+        env:
+          EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
+          EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
+          EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
+        run: |
+          cd vm
+
+          cat > user-data <<EOF
+#cloud-config
+hostname: debian-kvm
+ssh_pwauth: true
+disable_root: false
+
+users:
+  - name: NvdAdmin
+    groups: sudo
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    lock_passwd: false
+    passwd: $(openssl passwd -6 "${DEBIAN_ROOT_PASSWORD:-P@ssw0rd123}")
+
+packages:
+  - openssh-server
+  - curl
+  - unzip
+  - jq
+  - sudo
+
+runcmd:
+  - systemctl enable ssh
+  - |
+    mkdir -p /opt/easytier
+    VER=$(curl -s https://api.github.com/repos/EasyTier/EasyTier/releases/latest | jq -r .tag_name)
+    URL=$(curl -s https://api.github.com/repos/EasyTier/EasyTier/releases/latest | jq -r '.assets[].browser_download_url' | grep linux-x86_64 | head -1)
+    curl -L "$URL" -o /tmp/easytier.zip
+    unzip -o /tmp/easytier.zip -d /opt/easytier
+    chmod +x /opt/easytier/easytier-core
+    cat >/opt/easytier/config.toml <<EOT
+hostname="debian-kvm"
+listeners=["tcp://0.0.0.0:11010"]
+[network_identity]
+network_name="${EASYTIER_NETWORK_NAME}"
+network_secret="${EASYTIER_NETWORK_SECRET}"
+[[peer]]
+uri="${EASYTIER_PEER}"
+EOT
+    cat >/etc/systemd/system/easytier.service <<SERVICE
+[Unit]
+After=network-online.target
+[Service]
+ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml
+Restart=always
+[Install]
+WantedBy=multi-user.target
+SERVICE
+    systemctl daemon-reload
+    systemctl enable --now easytier
+EOF
+
+          cat > meta-data <<EOF
+instance-id: debian-kvm
+local-hostname: debian-kvm
+EOF
+
+          cloud-localds seed.iso user-data meta-data
+
+      - name: Start QEMU KVM VM
+        run: |
+          cd vm
+          sudo qemu-system-x86_64 \
+            -name debian-kvm \
+            -machine q35,accel=kvm \
+            -enable-kvm \
+            -cpu host \
+            -smp 2 \
+            -m 4096 \
+            -drive file=debian.qcow2,format=qcow2,if=virtio \
+            -drive file=seed.iso,format=raw,if=virtio,readonly=on \
+            -netdev user,id=n1,hostfwd=tcp::2222-:22 \
+            -device virtio-net-pci,netdev=n1 \
+            -nographic \
+            -serial file:serial.log \
+            >qemu.log 2>&1 &
+          echo $! > vm.pid
+
+      - name: Wait Debian and EasyTier
+        run: |
+          cd vm
+          for i in $(seq 1 120); do
+            if sshpass -p "${VM_PASSWORD:-P@ssw0rd123}" \
+              ssh -o StrictHostKeyChecking=no \
+              -p 2222 NvdAdmin@127.0.0.1 \
+              "echo ready" 2>/dev/null; then
+              break
+            fi
+            sleep 5
+          done
+
+          sshpass -p "${VM_PASSWORD:-P@ssw0rd123}" \
+          ssh -o StrictHostKeyChecking=no \
+          -p 2222 NvdAdmin@127.0.0.1 \
+          "systemd-detect-virt; systemctl status easytier --no-pager || true"
+
+      - name: Keep VM alive
+        run: |
+          cd vm
+          for i in $(seq 1 330); do
+            kill -0 $(cat vm.pid) || exit 1
+            echo "VM running $i/330"
+            sleep 60
+          done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-kvm-debug
+          path: vm/
