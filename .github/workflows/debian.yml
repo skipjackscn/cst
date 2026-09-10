@@ -1,194 +1,774 @@
-name: Debian QEMU KVM EasyTier Server
+# ==============================================================================
+#  Debian 13 (trixie) QEMU/KVM 虚拟机 + EasyTier（可选 exit-node 出口节点模式）
+# ------------------------------------------------------------------------------
+#  修正版 / 修正点见文件末尾 CHANGELOG 注释块
+#
+#  需要的 Secrets（Settings → Secrets and variables → Actions → Repository secrets）
+#    DEBIAN_ROOT_PASSWORD    VM 中 NvdAdmin 用户的密码；留空则自动生成随机密码
+#    EASYTIER_NETWORK_NAME   EasyTier 网络名
+#    EASYTIER_NETWORK_SECRET EasyTier 网络密钥
+#    EASYTIER_PEER           引导节点 URI，可留空（走官方公共节点）
+#                            例如 tcp://public.easytier.top:11010
+#                            或   udp://1.2.3.4:11010
+#
+#  运行器要求
+#    - 需要 /dev/kvm（嵌套虚拟化）。GitHub 托管 ubuntu-latest 属于"技术可行但不
+#      官方支持"，可用则自动使用 KVM，不可用则按 require_kvm 输入决定是否回退 TCG。
+#    - 若 KVM 长期不可用，请改用自托管运行器（self-hosted）或 larger runner。
+#
+#  客户端如何使用本出口节点
+#    在自己的机器上：easytier-core -d --network-name <名称> --network-secret <密钥> \
+#                      --exit-nodes <本节点的虚拟 IPv4>
+#    或在配置中写 exit_nodes = ["<本节点的虚拟 IPv4>"]
+# ==============================================================================
+
+name: Debian 13 QEMU/KVM + EasyTier (exit-node)
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_exit_node:
+        description: '以出口节点（exit node）模式运行，允许其它节点经本节点访问公网'
+        type: boolean
+        default: true
+      easytier_ipv4:
+        description: '本节点虚拟 IPv4（出口节点强烈建议固定）。留空则由 DHCP 分配'
+        type: string
+        default: '10.126.126.1/24'
+      easytier_hostname:
+        description: 'EasyTier 中显示的主机名'
+        type: string
+        default: 'gh-exit-node'
+      easytier_version:
+        description: 'EasyTier 版本：latest 或具体 tag（如 v2.4.5）'
+        type: string
+        default: 'latest'
+      easytier_peer:
+        description: '引导节点 URI，覆盖 Secret EASYTIER_PEER（可留空）'
+        type: string
+        default: ''
+      relay_network_whitelist:
+        description: '允许使用本出口的网络名白名单，空格分隔，* 表示全部'
+        type: string
+        default: '*'
+      proxy_forward_by_system:
+        description: '用系统内核转发（禁用 EasyTier 内置 NAT，需 iptables MASQUERADE）'
+        type: boolean
+        default: false
+      vm_cpus:
+        description: '虚拟机 CPU 核数'
+        type: string
+        default: '2'
+      vm_memory:
+        description: '虚拟机内存（MB）'
+        type: string
+        default: '4096'
+      vm_disk:
+        description: '虚拟机磁盘大小（qemu-img 单位）'
+        type: string
+        default: '20G'
+      keep_alive_minutes:
+        description: '虚拟机保持存活的分钟数（job 上限 360 分钟）'
+        type: string
+        default: '330'
+      require_kvm:
+        description: '无 /dev/kvm 时直接失败（关闭则用纯软件模拟 TCG，很慢）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian-kvm-easytier
+  cancel-in-progress: true
 
 env:
   VM_USER: NvdAdmin
-  VM_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+  VM_HOSTNAME: debian-kvm
+  HOST_SSH_PORT: '2222'
+  WORK_DIR: vm
 
 jobs:
   debian-kvm:
+    name: Boot Debian 13 VM and join EasyTier
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    env:
+      ET_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
+      ET_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
+      ET_PEER_INPUT: ${{ inputs.easytier_peer }}
+      ET_PEER_SECRET: ${{ secrets.EASYTIER_PEER }}
+      VM_PASSWORD_SECRET: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+      ENABLE_EXIT_NODE: ${{ inputs.enable_exit_node }}
+      ET_IPV4: ${{ inputs.easytier_ipv4 }}
+      ET_VERSION: ${{ inputs.easytier_version }}
+      ET_HOSTNAME: ${{ inputs.easytier_hostname }}
+      RELAY_WHITELIST: ${{ inputs.relay_network_whitelist }}
+      PROXY_FORWARD_BY_SYSTEM: ${{ inputs.proxy_forward_by_system }}
+
     steps:
-      - name: Install QEMU KVM packages
+      # ---------------------------------------------------------------------
+      - name: Preflight / 环境与嵌套虚拟化检查
+        id: preflight
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
+          echo "== runner =="
+          nproc; free -h; df -h "$RUNNER_TEMP" 2>/dev/null || true
+          echo "== 虚拟化 =="
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+              echo "kvm=available" >> "$GITHUB_OUTPUT"
+            else
+              echo "kvm=permission" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "kvm=missing" >> "$GITHUB_OUTPUT"
+          fi
+          grep -o -m1 -E 'vmx|svm' /proc/cpuinfo | head -1 || echo "CPU 标志中未看到 vmx/svm"
+
+      # ---------------------------------------------------------------------
+      - name: Enable KVM device permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm 2>/dev/null || true
+          ls -l /dev/kvm 2>/dev/null || echo "/dev/kvm 不存在"
+
+      # ---------------------------------------------------------------------
+      - name: Install QEMU / cloud-init tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 \
             qemu-utils \
             cloud-image-utils \
             sshpass \
             curl \
+            ca-certificates \
             jq \
-            unzip
+            unzip \
+            python3-yaml
 
-          if [ ! -e /dev/kvm ]; then
-            echo "ERROR: /dev/kvm unavailable"
+          if [ "${{ inputs.require_kvm }}" = "true" ] && [ ! -w /dev/kvm ]; then
+            echo "::error::/dev/kvm 不可用。请使用支持嵌套虚拟化的自托管运行器，"\
+                 "或把 require_kvm 设为 false 以使用纯软件模拟（非常慢）。"
             exit 1
           fi
 
+      # ---------------------------------------------------------------------
       - name: Download Debian 13 cloud image
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p vm
-          cd vm
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
 
-          curl -fL --retry 5 \
-            -o debian.qcow2 \
-            https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+          curl -fL --retry 5 --retry-delay 5 -o debian.qcow2 "$URL"
 
-          qemu-img resize debian.qcow2 20G
+          qemu-img info debian.qcow2
+          qemu-img resize debian.qcow2 "${{ inputs.vm_disk }}"
+          echo "镜像解压后大小：$(du -h debian.qcow2 | cut -f1)"
 
-      - name: Create cloud-init seed
-        shell: bash
-        env:
-          EASYTIER_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
-          EASYTIER_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
-          EASYTIER_PEER: ${{ secrets.EASYTIER_PEER }}
-        run: |
-          set -euo pipefail
-          cd vm
-
-          PASSWORD_HASH=$(openssl passwd -6 "${VM_PASSWORD:-P@ssw0rd123}")
-
-          cat > user-data <<EOF
-#cloud-config
-hostname: debian-kvm
-ssh_pwauth: true
-
-users:
-  - name: NvdAdmin
-    groups: sudo
-    shell: /bin/bash
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    lock_passwd: false
-    passwd: ${PASSWORD_HASH}
-
-package_update: true
-
-packages:
-  - openssh-server
-  - curl
-  - unzip
-  - jq
-  - sudo
-
-runcmd:
-  - systemctl enable ssh
-  - |
-      mkdir -p /opt/easytier
-      URL=\$(curl -s https://api.github.com/repos/EasyTier/EasyTier/releases/latest | jq -r '.assets[].browser_download_url' | grep linux-x86_64 | head -1)
-      curl -L "\$URL" -o /tmp/easytier.zip
-      unzip -o /tmp/easytier.zip -d /opt/easytier
-      chmod +x /opt/easytier/easytier-core
-
-      cat >/opt/easytier/config.toml <<CONFIG
-hostname="debian-kvm"
-listeners=["tcp://0.0.0.0:11010"]
-
-[network_identity]
-network_name="${EASYTIER_NETWORK_NAME}"
-network_secret="${EASYTIER_NETWORK_SECRET}"
-
-[[peer]]
-uri="${EASYTIER_PEER}"
-CONFIG
-
-      cat >/etc/systemd/system/easytier.service <<SERVICE
-[Unit]
-Description=EasyTier
-After=network-online.target
-
-[Service]
-ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-
-      systemctl daemon-reload
-      systemctl enable --now easytier
-EOF
-
-          cat > meta-data <<EOF
-instance-id: debian-kvm
-local-hostname: debian-kvm
-EOF
-
-          cloud-localds seed.iso user-data meta-data
-
-      - name: Start QEMU KVM Debian VM
+      # ---------------------------------------------------------------------
+      #  cloud-init 种子盘
+      #  说明：heredoc 的内容与结束符必须保持与 run 块相同的缩进，否则 YAML
+      #        块标量会提前终止（原文件正是因此无法被 GitHub 解析）。
+      #        模板使用 <<'UDCFG' 单引号形式，内部所有 $ 原样保留，
+      #        需要注入的值统一用 __XXX__ 占位符，随后由 python 安全替换。
+      # ---------------------------------------------------------------------
+      - name: Build cloud-init seed
         shell: bash
         run: |
           set -euo pipefail
-          cd vm
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
 
-          sudo qemu-system-x86_64 \
-            -name debian-kvm \
-            -machine q35,accel=kvm \
-            -enable-kvm \
-            -cpu host \
-            -smp 2 \
-            -m 4096 \
-            -drive file=debian.qcow2,format=qcow2,if=virtio \
+          # 密码：优先用 Secret，否则随机生成
+          VM_PASSWORD="${VM_PASSWORD_SECRET:-}"
+          if [ -z "$VM_PASSWORD" ]; then
+            VM_PASSWORD="$(openssl rand -base64 18)"
+            echo "::notice::未设置 DEBIAN_ROOT_PASSWORD，已自动生成随机密码（见 Job Summary）"
+            echo "GENERATED_PASSWORD=$VM_PASSWORD" >> generated.env
+          fi
+          printf '%s' "$VM_PASSWORD" > .vm_password
+          chmod 600 .vm_password
+
+          PASSWORD_HASH="$(openssl passwd -6 "$VM_PASSWORD")"
+          printf '%s' "$PASSWORD_HASH" > .vm_password_hash
+          export PASSWORD_HASH
+
+          cat > user-data.tpl <<'UDCFG'
+          #cloud-config
+          hostname: __VM_HOSTNAME__
+          ssh_pwauth: true
+          disable_root: true
+          ssh_deletekeys: true
+
+          users:
+            - name: __VM_USER__
+              groups: sudo
+              shell: /bin/bash
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: false
+              passwd: __PASSWORD_HASH__
+
+          package_update: true
+          package_upgrade: false
+
+          packages:
+            - openssh-server
+            - curl
+            - ca-certificates
+            - unzip
+            - jq
+            - sudo
+            - iptables
+            - iproute2
+            - iputils-ping
+            - dnsutils
+
+          write_files:
+            - path: /usr/local/sbin/easytier-install.sh
+              permissions: '0755'
+              owner: 'root:root'
+              content: |
+                #!/usr/bin/env bash
+                # 由 cloud-init 写入，负责安装并配置 EasyTier（含可选 exit-node）
+                set -euo pipefail
+
+                ET_DIR=/opt/easytier
+                LOG_TAG="[easytier-install]"
+                log() { echo "$LOG_TAG $*"; }
+
+                # ---------- 1. TUN 设备 ----------
+                modprobe tun 2>/dev/null || true
+                mkdir -p /dev/net
+                if [ ! -c /dev/net/tun ]; then
+                  mknod /dev/net/tun c 10 200 || true
+                  chmod 0666 /dev/net/tun || true
+                fi
+
+                # ---------- 2. 下载 EasyTier ----------
+                mkdir -p "$ET_DIR"
+                ET_VERSION="__ET_VERSION__"
+                if [ "$ET_VERSION" = "latest" ]; then
+                  API="https://api.github.com/repos/EasyTier/EasyTier/releases/latest"
+                else
+                  API="https://api.github.com/repos/EasyTier/EasyTier/releases/tags/${ET_VERSION}"
+                fi
+
+                URL="$(curl -fsSL "$API" \
+                  | jq -r '.assets[].browser_download_url' \
+                  | grep -E 'easytier-linux-x86_64-.*\.zip$' \
+                  | head -n 1 || true)"
+                if [ -z "$URL" ]; then
+                  log "ERROR: 未找到 x86_64 资源（tag=$ET_VERSION）"
+                  exit 1
+                fi
+                log "下载 $URL"
+                curl -fsSL --retry 5 --retry-delay 5 -o /tmp/easytier.zip "$URL"
+                unzip -o -j /tmp/easytier.zip -d "$ET_DIR"
+                chmod +x "$ET_DIR"/easytier-* 2>/dev/null || true
+                test -x "$ET_DIR/easytier-core" || { log "ERROR: easytier-core 缺失"; exit 1; }
+                "$ET_DIR/easytier-core" --version || true
+
+                # ---------- 3. config.toml ----------
+                cat > "$ET_DIR/config.toml" <<'ETCFG'
+                instance_name = "default"
+                hostname = "__ET_HOSTNAME__"
+                dhcp = __ET_DHCP__
+                __ET_IPV4_LINE__
+                rpc_portal = "127.0.0.1:15888"
+                exit_nodes = []
+
+                listeners = [
+                  "tcp://0.0.0.0:11010",
+                  "udp://0.0.0.0:11010",
+                  "tcp://[::]:11010",
+                  "udp://[::]:11010",
+                  "wg://0.0.0.0:11011",
+                ]
+
+                [network_identity]
+                network_name = "__ET_NETWORK_NAME__"
+                network_secret = "__ET_NETWORK_SECRET__"
+
+                __ET_PEER_BLOCK__
+
+                [flags]
+                dev_name = "et0"
+                enable_exit_node = __ET_ENABLE_EXIT_NODE__
+                use_smoltcp = __ET_USE_SMOLTCP__
+                proxy_forward_by_system = __ET_PROXY_FORWARD_BY_SYSTEM__
+                relay_network_whitelist = "__RELAY_WHITELIST__"
+                private_mode = true
+                latency_first = true
+                multi_thread = true
+                enable_encryption = true
+                ETCFG
+
+                # ---------- 4. 出口节点：内核转发 + NAT ----------
+                if [ "__ET_ENABLE_EXIT_NODE__" = "true" ]; then
+                  cat > /etc/sysctl.d/99-easytier-exit-node.conf <<'SYSCTL'
+                net.ipv4.ip_forward = 1
+                net.ipv6.conf.all.forwarding = 1
+                net.ipv4.conf.all.rp_filter = 0
+                net.ipv4.conf.default.rp_filter = 0
+                SYSCTL
+                  sysctl --system >/dev/null 2>&1 || true
+                  sysctl -w net.ipv4.ip_forward=1 || true
+                  log "ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)"
+                fi
+
+                # ---------- 5. NAT 脚本（由 systemd ExecStartPost 调用） ----------
+                cat > /usr/local/sbin/easytier-nat.sh <<'NATSH'
+                #!/usr/bin/env bash
+                # 出口节点 NAT 规则安装脚本（幂等，可重复执行）
+                set -uo pipefail
+                ET_IF=et0
+                ENABLED="__ET_ENABLE_EXIT_NODE__"
+                if [ "$ENABLED" != "true" ]; then
+                  echo "easytier-nat: exit-node 未启用，跳过"
+                  exit 0
+                fi
+
+                sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+                for _ in $(seq 1 30); do
+                  ip link show "$ET_IF" >/dev/null 2>&1 && break
+                  sleep 1
+                done
+
+                OUT_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+                [ -n "$OUT_IF" ] || OUT_IF="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
+                if [ -z "$OUT_IF" ]; then
+                  echo "easytier-nat: 无法确定出口网卡，放弃"
+                  exit 0
+                fi
+
+                iptables -t nat -C POSTROUTING -o "$OUT_IF" -j MASQUERADE 2>/dev/null \
+                  || iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE
+                iptables -C FORWARD -i "$ET_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null \
+                  || iptables -A FORWARD -i "$ET_IF" -o "$OUT_IF" -j ACCEPT
+                iptables -C FORWARD -i "$OUT_IF" -o "$ET_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+                  || iptables -A FORWARD -i "$OUT_IF" -o "$ET_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+                iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+                  || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+                echo "easytier-nat: MASQUERADE ${ET_IF} -> ${OUT_IF}"
+                NATSH
+                chmod 0755 /usr/local/sbin/easytier-nat.sh
+
+                # ---------- 6. systemd 单元 ----------
+                cat > /etc/systemd/system/easytier.service <<'ETSVC'
+                [Unit]
+                Description=EasyTier networking daemon
+                Documentation=https://easytier.cn
+                After=network-online.target
+                Wants=network-online.target
+
+                [Service]
+                Type=simple
+                ExecStartPre=/sbin/modprobe tun
+                ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml
+                ExecStartPost=/usr/local/sbin/easytier-nat.sh
+                Restart=always
+                RestartSec=5
+                LimitNOFILE=1048576
+                CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+                AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+                NoNewPrivileges=false
+
+                [Install]
+                WantedBy=multi-user.target
+                ETSVC
+
+                # ---------- 7. 启动 ----------
+                systemctl daemon-reload
+                /usr/local/sbin/easytier-nat.sh || true
+                systemctl enable easytier.service
+                systemctl restart easytier.service
+                log "EasyTier 已启动"
+
+          runcmd:
+            - [ systemctl, enable, --now, ssh ]
+            - /usr/local/sbin/easytier-install.sh
+          UDCFG
+
+          # -------------------------------------------------------------------
+          # 占位符注入 + 格式自检（YAML 必须可被解析，否则立即失败）
+          # -------------------------------------------------------------------
+          python3 - <<'PYEOF'
+          import os, re, sys, yaml
+
+          tpl = open("user-data.tpl", encoding="utf-8").read()
+
+          exit_node = os.environ.get("ENABLE_EXIT_NODE", "false").strip().lower() == "true"
+          ipv4 = os.environ.get("ET_IPV4", "").strip()
+          peer = (os.environ.get("ET_PEER_INPUT", "") or os.environ.get("ET_PEER_SECRET", "")).strip()
+
+          def toml_str(v: str) -> str:
+              return v.replace("\\", "\\\\").replace('"', '\\"')
+
+          # 注意：__ET_PEER_BLOCK__ 出现在 write_files 的 content 块中（缩进 6），
+          # 多行替换时必须为后续行补齐同样的缩进，否则会截断 YAML 块标量。
+          INDENT = " " * 6
+          ipv4_line = f'ipv4 = "{toml_str(ipv4)}"' if ipv4 else '# ipv4 未指定，使用 DHCP 分配'
+          if peer:
+              peer_block = f'[[peer]]\n{INDENT}uri = "{toml_str(peer)}"'
+          else:
+              peer_block = '# 未配置引导节点，依赖公共节点发现'
+
+          mapping = {
+              "__VM_HOSTNAME__": os.environ.get("VM_HOSTNAME", "debian-kvm"),
+              "__VM_USER__": os.environ.get("VM_USER", "NvdAdmin"),
+              "__PASSWORD_HASH__": open(".vm_password_hash", encoding="utf-8").read(),
+              "__ET_VERSION__": os.environ.get("ET_VERSION", "latest") or "latest",
+              "__ET_HOSTNAME__": os.environ.get("ET_HOSTNAME", "gh-exit-node"),
+              "__ET_DHCP__": "false" if ipv4 else "true",
+              "__ET_IPV4_LINE__": ipv4_line,
+              "__ET_PEER_BLOCK__": peer_block,
+              "__ET_NETWORK_NAME__": toml_str(os.environ.get("ET_NETWORK_NAME", "")),
+              "__ET_NETWORK_SECRET__": toml_str(os.environ.get("ET_NETWORK_SECRET", "")),
+              "__ET_ENABLE_EXIT_NODE__": "true" if exit_node else "false",
+              "__ET_USE_SMOLTCP__": "true" if exit_node else "false",
+              "__ET_PROXY_FORWARD_BY_SYSTEM__": (
+                  "true" if os.environ.get("PROXY_FORWARD_BY_SYSTEM", "false").strip().lower() == "true" else "false"
+              ),
+              "__RELAY_WHITELIST__": toml_str(os.environ.get("RELAY_WHITELIST", "*") or "*"),
+          }
+
+          for k, v in mapping.items():
+              tpl = tpl.replace(k, v)
+
+          left = re.findall(r"__[A-Z0-9_]+__", tpl)
+          if left:
+              sys.exit(f"存在未替换的占位符: {sorted(set(left))}")
+
+          # 关键：cloud-init 的 user-data 必须是合法 YAML
+          cfg = yaml.safe_load(tpl)
+          assert isinstance(cfg, dict), "user-data 顶层不是映射"
+          assert cfg.get("write_files"), "write_files 缺失"
+          assert cfg.get("runcmd"), "runcmd 缺失"
+
+          with open("user-data", "w", encoding="utf-8") as f:
+              f.write(tpl)
+
+          print("user-data 生成成功并通过 YAML 校验")
+          print("  hostname :", cfg.get("hostname"))
+          print("  runcmd   :", cfg.get("runcmd"))
+          PYEOF
+
+          cat > meta-data <<'MDEOF'
+          instance-id: debian-kvm-easytier
+          local-hostname: debian-kvm
+          MDEOF
+
+          cloud-localds -v seed.iso user-data meta-data
+          echo "seed.iso: $(du -h seed.iso | cut -f1)"
+
+      # ---------------------------------------------------------------------
+      - name: Start QEMU VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          mkdir -p logs
+
+          if [ -w /dev/kvm ]; then
+            ACCEL="-machine q35,accel=kvm -enable-kvm -cpu host"
+            echo "使用 KVM 硬件加速"
+          else
+            ACCEL="-machine q35 -cpu max"
+            echo "::warning::/dev/kvm 不可用，回退到 TCG 软件模拟，启动会非常慢"
+          fi
+
+          nohup qemu-system-x86_64 \
+            $ACCEL \
+            -name "$VM_HOSTNAME" \
+            -smp "${{ inputs.vm_cpus }}" \
+            -m "${{ inputs.vm_memory }}" \
+            -drive file=debian.qcow2,format=qcow2,if=virtio,discard=unmap \
             -drive file=seed.iso,format=raw,if=virtio,readonly=on \
-            -netdev user,id=net0,hostfwd=tcp::2222-:22 \
-            -device virtio-net-pci,netdev=net0 \
-            -nographic \
-            -serial file:serial.log \
-            >qemu.log 2>&1 &
+            -netdev user,id=net0,hostfwd=tcp::${HOST_SSH_PORT}-:22,hostfwd=tcp::11010-:11010,hostfwd=udp::11010-:11010 \
+            -device virtio-net-pci,netdev=net0,romfile= \
+            -display none \
+            -monitor none \
+            -serial file:logs/serial.log \
+            >logs/qemu.log 2>&1 &
 
-          echo $! > vm.pid
+          echo $! > qemu.pid
+          sleep 5
+          if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+            echo "::error::QEMU 启动后立即退出"
+            cat logs/qemu.log || true
+            exit 1
+          fi
+          echo "QEMU PID: $(cat qemu.pid)"
 
-      - name: Wait Debian SSH
+      # ---------------------------------------------------------------------
+      - name: Wait for SSH
         shell: bash
         run: |
           set -euo pipefail
-          cd vm
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
 
-          for i in $(seq 1 120); do
-            if sshpass -p "${VM_PASSWORD:-P@ssw0rd123}" \
-              ssh -o StrictHostKeyChecking=no \
-              -p 2222 ${VM_USER}@127.0.0.1 "echo READY" 2>/dev/null; then
-              echo "Debian SSH ready"
+          ssh_base=(sshpass -p "$VM_PASSWORD" ssh
+                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+                    -o ConnectTimeout=10 -o LogLevel=ERROR
+                    -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1)
+
+          for i in $(seq 1 180); do
+            if "${ssh_base[@]}" "echo READY" 2>/dev/null; then
+              echo "SSH 就绪（第 ${i} 次探测）"
               exit 0
             fi
             sleep 5
           done
 
-          echo "SSH timeout"
-          cat qemu.log || true
-          tail -200 serial.log || true
+          echo "::error::SSH 连接超时"
+          tail -60 logs/qemu.log || true
+          tail -80 logs/serial.log || true
           exit 1
 
-      - name: Check EasyTier
+      # ---------------------------------------------------------------------
+      - name: Wait for cloud-init + EasyTier
         shell: bash
         run: |
-          sshpass -p "${VM_PASSWORD:-P@ssw0rd123}" \
-          ssh -o StrictHostKeyChecking=no \
-          -p 2222 ${VM_USER}@127.0.0.1 \
-          "systemd-detect-virt; systemctl status easytier --no-pager || true; ip addr"
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
 
+          ssh_exec() { # ssh_exec <本地脚本文件>
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1 \
+              "sudo -n tee /tmp/remote.sh >/dev/null && sudo -n bash /tmp/remote.sh" < "$1"
+          }
+
+          cat > wait-init.sh <<'RSH'
+          set -x
+          cloud-init status --wait --timeout 1200 || cloud-init status --long
+          systemctl is-active easytier \
+            || { journalctl -u easytier -n 200 --no-pager; exit 1; }
+          ip -brief addr
+          ip link show et0 || true
+          RSH
+          ssh_exec wait-init.sh
+
+      # ---------------------------------------------------------------------
+      - name: Verify EasyTier + exit-node
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+
+          ssh_exec() {
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=15 -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1 \
+              "sudo -n tee /tmp/remote.sh >/dev/null && sudo -n bash /tmp/remote.sh" < "$1"
+          }
+
+          cat > verify.sh <<'RSH'
+          set -e
+          ET=/opt/easytier
+          echo "===== easytier-cli node ====="
+          "$ET/easytier-cli" node || true
+          echo "===== easytier-cli peer ====="
+          "$ET/easytier-cli" peer || true
+          echo "===== easytier-cli route ====="
+          "$ET/easytier-cli" route || true
+          echo "===== exit-node 检查 ====="
+          if grep -Eq '^enable_exit_node = true' "$ET/config.toml"; then
+            echo "config.toml: enable_exit_node = true  [OK]"
+            test "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" \
+              && echo "net.ipv4.ip_forward = 1  [OK]" \
+              || { echo "ip_forward 未开启  [FAIL]"; exit 1; }
+            if [ -x /usr/local/sbin/easytier-nat.sh ]; then
+              /usr/local/sbin/easytier-nat.sh
+            fi
+            iptables -t nat -S | grep -q MASQUERADE \
+              && echo "iptables MASQUERADE  [OK]" \
+              || echo "iptables MASQUERADE 缺失（内置 NAT 模式下可忽略）"
+          else
+            echo "未启用 exit-node，跳过出口检查"
+          fi
+          RSH
+          ssh_exec verify.sh
+
+      # ---------------------------------------------------------------------
+      - name: Connection summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+          ET_IP="${ET_IPV4:-（DHCP 自动分配）}"
+
+          {
+            echo "## Debian 13 VM + EasyTier"
+            echo
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 网络名 | \`${ET_NETWORK_NAME:-（未设置）}\` |"
+            echo "| 主机名 | \`${ET_HOSTNAME}\` |"
+            echo "| 虚拟 IPv4 | \`${ET_IP}\` |"
+            echo "| EasyTier 版本 | \`${ET_VERSION}\` |"
+            echo "| Exit node | \`${ENABLE_EXIT_NODE}\` |"
+            echo "| SSH（runner 本机） | \`ssh -p ${HOST_SSH_PORT} ${VM_USER}@127.0.0.1\` |"
+            if [ -f generated.env ]; then
+              echo "| VM 密码 | 自动生成：\`${VM_PASSWORD}\` |"
+            else
+              echo "| VM 密码 | 使用 Secret \`DEBIAN_ROOT_PASSWORD\` |"
+            fi
+            echo
+            echo "### 客户端如何走这个出口"
+            echo '```bash'
+            if [ "${ENABLE_EXIT_NODE}" = "true" ] && [ -n "${ET_IPV4}" ]; then
+              echo "easytier-core -d --network-name '${ET_NETWORK_NAME}' \\"
+              echo "  --network-secret '<你的密钥>' \\"
+              echo "  --exit-nodes ${ET_IPV4%/*}"
+            else
+              echo "# 未在输入中固定 IPv4，请先在 VM 内执行："
+              echo "#   sudo /opt/easytier/easytier-cli node"
+              echo "# 取得本机虚拟 IP，再在客户端配置 --exit-nodes <该 IP>"
+            fi
+            echo '```'
+            echo
+            echo "> GitHub 托管运行器位于 NAT 之后，入站不可达；节点依靠 \`EASYTIER_PEER\`"
+            echo "> 引导节点或 UDP 打洞与客户端建立连接。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------------------------------------------------------------------
       - name: Keep VM alive
         shell: bash
         run: |
-          cd vm
-          for i in $(seq 1 330); do
-            kill -0 "$(cat vm.pid)" || exit 1
-            echo "QEMU/KVM running ${i}/330"
+          set -euo pipefail
+          cd "$WORK_DIR"
+          PID="$(cat qemu.pid)"
+          TOTAL="${{ inputs.keep_alive_minutes }}"
+          for i in $(seq 1 "$TOTAL"); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::QEMU 进程 $PID 已退出"
+              tail -80 logs/qemu.log || true
+              exit 1
+            fi
+            echo "VM 运行中 ${i}/${TOTAL} 分钟"
             sleep 60
           done
+
+      # ---------------------------------------------------------------------
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          if [ -f .vm_password ]; then
+            VM_PASSWORD="$(cat .vm_password)"
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -o ConnectTimeout=10 -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1 \
+              "sudo -n bash -c 'journalctl -u easytier -n 300 --no-pager; \
+                                echo ===; cat /opt/easytier/config.toml; \
+                                echo ===; cloud-init status --long'" \
+              > logs/easytier.log 2>&1 || echo "未能从 VM 抓取日志" > logs/easytier.log
+          fi
+          rm -f .vm_password .vm_password_hash
+
+      - name: Stop VM
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR" || exit 0
+          if [ -f qemu.pid ]; then
+            PID="$(cat qemu.pid)"
+            kill "$PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            kill -9 "$PID" 2>/dev/null || true
+          fi
 
       - name: Upload debug logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debian-kvm-debug
-          path: vm/
+          name: debian-kvm-easytier-logs
+          retention-days: 7
+          if-no-files-found: warn
+          # 只传日志与 user-data，绝不上传 qcow2 / seed.iso 等大文件
+          path: |
+            ${{ env.WORK_DIR }}/logs/
+            ${{ env.WORK_DIR }}/user-data
+            ${{ env.WORK_DIR }}/user-data.tpl
+
+# ==============================================================================
+#  CHANGELOG（相对原始 debian.yml）
+#
+#  【致命格式错误 · 已修复】
+#    1. 原文件在 run: | 块中写 heredoc 时，cloud-init 内容（#cloud-config、
+#       hostname=、CONFIG、SERVICE、EOF 等）全部顶格书写。YAML 块标量的缩进量
+#       由块内第一行决定（此处为 10 空格），一旦出现缩进更小的行，块标量立即
+#       终止，后续内容被当成新的 YAML 映射解析 —— 结果是整个 workflow 文件
+#       连解析都过不了（scanner error: could not find expected ':'），
+#       GitHub 会直接报 "Invalid workflow file"。
+#       修复：heredoc 正文与结束符统一缩进到 run 块级别。
+#
+#  【功能性缺陷 · 已修复】
+#    2. 嵌套 heredoc 的 config.toml / easytier.service 内容同样顶格，即便外层
+#       侥幸解析成功，写入 user-data 后也会被 cloud-init 判为非法 YAML，
+#       runcmd 只剩 systemctl enable ssh，EasyTier 根本不会安装。
+#       修复：改用 write_files 下发独立安装脚本，脚本内再生成配置，层级更浅。
+#    3. EasyTier 二进制路径错误：release zip 内是 easytier-linux-x86_64/easytier-core，
+#       原脚本 unzip 后直接 chmod /opt/easytier/easytier-core 必然失败。
+#       修复：unzip -j 扁平解压 + 存在性断言。
+#    4. release 资源匹配过宽（grep linux-x86_64 可能命中 GUI 包）。
+#       修复：正则锚定 easytier-linux-x86_64-*.zip。
+#    5. /dev/kvm 权限：GitHub 运行器上默认不可写，原脚本直接 sudo 启动 QEMU，
+#       生成的文件属主为 root，upload-artifact 会失败。
+#       修复：udev 规则 + chmod 0666，以普通用户运行 QEMU。
+#    6. upload-artifact 直接上传 vm/，会把 20G 的 qcow2 一起打包。
+#       修复：只上传 logs/ 与 user-data。
+#    7. 缺少 SSH 就绪后的 cloud-init 完成等待，后续检查常在半初始化状态下失败。
+#    8. 密码为空时回退到硬编码弱口令 P@ssw0rd123。
+#       修复：未设置 Secret 时自动生成随机密码并写入 Job Summary。
+#
+#  【新增 EasyTier exit-node 模式】
+#    9. 新增 workflow_dispatch 输入：enable_exit_node / easytier_ipv4 /
+#       easytier_version / relay_network_whitelist / proxy_forward_by_system 等。
+#   10. config.toml 增加 [flags]：enable_exit_node、use_smoltcp、
+#       proxy_forward_by_system、relay_network_whitelist、private_mode、
+#       dev_name=et0、multi_thread、latency_first。
+#   11. 出口节点所需的 net.ipv4.ip_forward / IPv6 forwarding / rp_filter 持久化
+#       到 /etc/sysctl.d/99-easytier-exit-node.conf，并由 easytier-nat.sh
+#       通过 systemd ExecStartPost 安装 iptables MASQUERADE。
+#   12. 监听器补全 udp://（原仅 tcp://，P2P 打洞必需）、IPv6 与 WireGuard 端口。
+#   13. 新增 easytier-cli node/peer/route 检查、exit-node 生效性断言、
+#       Job Summary 输出，以及客户端 --exit-nodes 用法示例。
+#   14. 生成 user-data 后用 python + PyYAML 做占位符注入与 YAML 格式自检，
+#       格式有问题时立即失败，不再等到 VM 启动后才发现。
+#
+#  【健壮性】
+#   15. 增加 concurrency、permissions、KVM 预检与 TCG 回退开关、
+#       启动失败立即打印 qemu/serial 日志、always() 清理与日志收集。
+# ==============================================================================
