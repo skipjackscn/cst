@@ -11,7 +11,7 @@
 # 连接: ssh NvdAdmin@<EasyTier IP>
 # 密码: P@ssw0rd1qazXSW@#
 
-name: do Debian SSH geasytier
+name: Debian KVM
 
 on:
   workflow_dispatch:
