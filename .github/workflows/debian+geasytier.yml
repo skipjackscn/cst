@@ -1,5 +1,5 @@
 # GitHub Actions: Debian SSH over EasyTier
-# 放到 .github/workflows/debian+easytier.yml
+# 放到 .github/workflows/debian+geasytier.yml
 #
 # Secrets (Settings - Secrets and variables - Actions):
 #   EASYTIER_NETWORK_NAME     必填
@@ -7,6 +7,12 @@
 #   EASYTIER_PEER             可选。支持多个 -p，例如:
 #                             -p tcp://1.2.3.4:11010 -p udp://1.2.3.4:11010 -p tcp://example.com:11010
 #                             留空则用 tcp://public.easytier.cn:11010
+#
+# Google Drive 挂载（挂载到 /home/NvdAdmin/GoogleDrive，完整读写）:
+#   RCLONE_CONF               推荐。完整的 rclone.conf 内容（明文）
+#   或 RCLONE_TOKEN           仅 token JSON（自动生成 [gdrive] 段）
+#   RCLONE_DRIVE_CLIENT_ID    可选。自定义 OAuth client_id
+#   RCLONE_DRIVE_CLIENT_SECRET 可选。自定义 OAuth client_secret
 #
 # 连接: ssh NvdAdmin@<EasyTier IP>
 # 密码: P@ssw0rd1qazXSW@#
@@ -188,12 +194,114 @@ jobs:
           echo "  ssh command  : ssh NvdAdmin@$et_ip"
           echo '=========================================='
 
+      - name: 2.5 Install and Mount Google Drive to ~/GoogleDrive
+        shell: bash
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+          RCLONE_TOKEN: ${{ secrets.RCLONE_TOKEN }}
+          RCLONE_DRIVE_CLIENT_ID: ${{ secrets.RCLONE_DRIVE_CLIENT_ID }}
+          RCLONE_DRIVE_CLIENT_SECRET: ${{ secrets.RCLONE_DRIVE_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          # 安装依赖
+          apt-get update
+          apt-get install -y --no-install-recommends fuse3 curl unzip ca-certificates
+          # 容器里经常没有 /dev/fuse
+          if [ ! -c /dev/fuse ]; then
+            mknod /dev/fuse c 10 229 || true
+            chmod 666 /dev/fuse || true
+          fi
+          if [ -f /etc/fuse.conf ] && ! grep -qE '^[[:space:]]*user_allow_other' /etc/fuse.conf; then
+            echo 'user_allow_other' >> /etc/fuse.conf
+          fi
+
+          # 安装最新官方 rclone（Debian 仓库版太旧）
+          if ! command -v rclone >/dev/null || rclone version 2>/dev/null | head -1 | grep -qE 'v1\.(0[0-9]|[1-5][0-9]|6[0-4])\.'; then
+            arch=$(dpkg --print-architecture)
+            case "$arch" in
+              amd64) rarch=linux-amd64 ;;
+              arm64) rarch=linux-arm64 ;;
+              *) rarch=linux-amd64 ;;
+            esac
+            tmp=$(mktemp -d)
+            curl -fsSL "https://downloads.rclone.org/rclone-current-${rarch}.zip" -o "$tmp/rclone.zip"
+            unzip -qo "$tmp/rclone.zip" -d "$tmp"
+            install -m 0755 "$(find "$tmp" -type f -name rclone | head -1)" /usr/local/bin/rclone
+            rm -rf "$tmp"
+          fi
+          rclone version | head -1
+
+          # 配置文件放到 NvdAdmin 家目录
+          USER_HOME=/home/NvdAdmin
+          mkdir -p "$USER_HOME/.config/rclone" "$USER_HOME/GoogleDrive" "$USER_HOME/.cache/rclone-gdrive"
+          conf="$USER_HOME/.config/rclone/rclone.conf"
+
+          if [ -n "${RCLONE_CONF:-}" ]; then
+            # 优先使用完整配置
+            printf '%s\n' "$RCLONE_CONF" > "$conf"
+          elif [ -n "${RCLONE_TOKEN:-}" ]; then
+            # 仅 token 时自动生成最小配置
+            cat > "$conf" <<EOF
+          [gdrive]
+          type = drive
+          scope = drive
+          token = ${RCLONE_TOKEN}
+          EOF
+            if [ -n "${RCLONE_DRIVE_CLIENT_ID:-}" ] && [ -n "${RCLONE_DRIVE_CLIENT_SECRET:-}" ]; then
+              cat >> "$conf" <<EOF
+          client_id = ${RCLONE_DRIVE_CLIENT_ID}
+          client_secret = ${RCLONE_DRIVE_CLIENT_SECRET}
+          EOF
+            fi
+          else
+            echo "ERROR: 请至少设置 Secret RCLONE_CONF 或 RCLONE_TOKEN" >&2
+            exit 1
+          fi
+          chown -R NvdAdmin:NvdAdmin "$USER_HOME/.config" "$USER_HOME/GoogleDrive" "$USER_HOME/.cache"
+          chmod 600 "$conf"
+
+          # 验证能否访问
+          if ! sudo -u NvdAdmin env HOME="$USER_HOME" rclone lsd gdrive: --max-depth 1 --retries 2; then
+            echo "ERROR: rclone 无法访问 gdrive，请检查 token/配置" >&2
+            exit 1
+          fi
+
+          # 后台挂载（完整读写 + VFS 缓存）
+          nohup sudo -u NvdAdmin env HOME="$USER_HOME" \
+            rclone mount gdrive: "$USER_HOME/GoogleDrive" \
+              --config "$conf" \
+              --vfs-cache-mode full \
+              --vfs-cache-max-size 5G \
+              --vfs-cache-max-age 72h \
+              --dir-cache-time 1h \
+              --poll-interval 1m \
+              --umask 022 \
+              --allow-non-empty \
+              --cache-dir "$USER_HOME/.cache/rclone-gdrive" \
+              > /tmp/gdrive-rclone.log 2>&1 &
+
+          # 等待挂载成功
+          for i in $(seq 1 30); do
+            if findmnt -n "$USER_HOME/GoogleDrive" >/dev/null 2>&1 || grep -q " $USER_HOME/GoogleDrive " /proc/mounts; then
+              echo "Google Drive 已挂载到 $USER_HOME/GoogleDrive"
+              ls -la "$USER_HOME/GoogleDrive" | head -15
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "挂载超时，日志：" >&2
+          tail -n 50 /tmp/gdrive-rclone.log || true
+          exit 1
+
       - name: 3. Keep Server Alive
         shell: bash
         run: |
           install_root=/opt/easytier
           log_dir=/var/log/easytier
           config_path=$install_root/config.toml
+          MOUNT_DIR=/home/NvdAdmin/GoogleDrive
           for i in $(seq 1 360); do
             if ! pgrep -x easytier-core >/dev/null; then
               echo "[$i/360] easytier-core stopped, restarting"
@@ -202,5 +310,18 @@ jobs:
               echo "[$i/360] Server running, pid=$(pgrep -x easytier-core | head -n1)"
             fi
             if ! pgrep -x sshd >/dev/null; then echo 'sshd stopped, restarting'; /usr/sbin/sshd || true; fi
+
+            # 守护 Google Drive 挂载
+            if ! findmnt -n "$MOUNT_DIR" >/dev/null 2>&1; then
+              echo "[$i/360] Google Drive 未挂载，尝试重新挂载"
+              nohup sudo -u NvdAdmin env HOME=/home/NvdAdmin \
+                rclone mount gdrive: "$MOUNT_DIR" \
+                  --config /home/NvdAdmin/.config/rclone/rclone.conf \
+                  --vfs-cache-mode full \
+                  --vfs-cache-max-size 5G \
+                  --allow-non-empty \
+                  --cache-dir /home/NvdAdmin/.cache/rclone-gdrive \
+                  > /tmp/gdrive-rclone.log 2>&1 &
+            fi
             sleep 60
           done
