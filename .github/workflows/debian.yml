@@ -76,11 +76,18 @@ jobs:
           chmod 600 .vm_password
           export HASH="$(openssl passwd -6 "$PASS")"
           python3 - <<'PY'
-          import os, pathlib, re, textwrap
+          import ipaddress
+          import os
+          import pathlib
+          import re
+          import textwrap
+          from urllib.parse import urlsplit, urlunsplit
+
           p = pathlib.Path('.')
           user = os.environ.get('VM_USER', 'NvdAdmin')
           host = os.environ.get('VM_HOSTNAME', 'debian-kvm')
           h = os.environ['HASH']
+
           ud = textwrap.dedent(f'''\
           #cloud-config
           hostname: {host}
@@ -99,24 +106,91 @@ jobs:
             - [systemctl, enable, --now, ssh]
           ''')
           p.joinpath('user-data').write_text(ud)
-          p.joinpath('meta-data').write_text('instance-id: cst-debian-kvm\nlocal-hostname: ' + host + '\n')
+          p.joinpath('meta-data').write_text(
+              'instance-id: cst-debian-kvm\nlocal-hostname: ' + host + '\n'
+          )
 
-          def esc(x):
-              return (x or '').replace('\\', '\\\\').replace('"', '\\"')
+          def esc(value):
+              return (value or '').replace('\\', '\\\\').replace('"', '\\"')
+
+          def split_peers(raw):
+              return [x for x in re.split(r'\s+|[,;]+', (raw or '').strip()) if x]
+
+          def normalize_peer(raw):
+              x = raw.strip()
+              if not x:
+                  return None
+
+              # EasyTier peer accepts URI form such as tcp://host:11010.
+              # Also accept plain hostname/IP/IPv6 and add tcp:// plus port.
+              if '://' in x:
+                  u = urlsplit(x)
+                  if u.scheme.lower() not in {'tcp', 'udp', 'wg', 'ws', 'wss'}:
+                      raise ValueError(f'unsupported EasyTier peer scheme: {u.scheme!r}')
+                  if not u.hostname:
+                      raise ValueError(f'invalid EasyTier peer URI: {x!r}')
+                  try:
+                      port = u.port
+                  except ValueError as exc:
+                      raise ValueError(f'invalid EasyTier peer port in {x!r}') from exc
+                  if port is None:
+                      port = 11010
+                  if not 1 <= port <= 65535:
+                      raise ValueError(f'EasyTier peer port out of range: {port}')
+                  host_part = u.hostname
+                  if ':' in host_part and not host_part.startswith('['):
+                      host_part = f'[{host_part}]'
+                  path = u.path or ''
+                  return urlunsplit((u.scheme.lower(), f'{host_part}:{port}', path, u.query, u.fragment))
+
+              x = x.rstrip('/')
+
+              # Bracketed IPv6: [2001:db8::1] or [2001:db8::1]:11010
+              if x.startswith('['):
+                  end = x.find(']')
+                  if end < 0:
+                      raise ValueError(f'invalid bracketed IPv6 peer: {x!r}')
+                  host_part = x[1:end]
+                  rest = x[end + 1:]
+                  if rest.startswith(':'):
+                      port_text = rest[1:]
+                      if not port_text.isdigit():
+                          raise ValueError(f'invalid EasyTier peer port: {x!r}')
+                      port = int(port_text)
+                  elif rest == '':
+                      port = 11010
+                  else:
+                      raise ValueError(f'invalid bracketed IPv6 peer: {x!r}')
+                  ipaddress.IPv6Address(host_part)
+                  return f'tcp://[{host_part}]:{port}'
+
+              # Bare IPv6 address.
+              if x.count(':') >= 2:
+                  ipaddress.IPv6Address(x)
+                  return f'tcp://[{x}]:11010'
+
+              # Plain IPv4/hostname, optionally with a numeric port.
+              host_part = x
+              port = 11010
+              if ':' in x:
+                  host_part, port_text = x.rsplit(':', 1)
+                  if not port_text.isdigit():
+                      raise ValueError(f'invalid EasyTier peer port: {x!r}')
+                  port = int(port_text)
+              if not host_part:
+                  raise ValueError(f'invalid EasyTier peer host: {x!r}')
+              if not 1 <= port <= 65535:
+                  raise ValueError(f'EasyTier peer port out of range: {port}')
+              return f'tcp://{host_part}:{port}'
 
           name = esc(os.environ['ET_NETWORK_NAME'])
           secret = esc(os.environ['ET_NETWORK_SECRET'])
-          raw_peer = (os.environ.get('ET_PEER') or '').strip()
-          tokens = [x.strip() for x in re.split(r'[\\s,;]+', raw_peer) if x.strip()]
+          raw_peer = os.environ.get('ET_PEER', '')
           peers = []
-          for x in tokens:
-              # EASYTIER_PEER may be supplied as only a hostname/IP. EasyTier requires a URI scheme.
-              if not re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', x):
-                  x = 'tcp://' + x
-              x = x.rstrip('/')
-              if not re.search(r':\\d+$', x):
-                  x += ':11010'
-              peers.append(x)
+          for token in split_peers(raw_peer):
+              peer = normalize_peer(token)
+              if peer and peer not in peers:
+                  peers.append(peer)
           if not peers:
               peers = ['tcp://public.easytier.top:11010']
 
@@ -161,8 +235,29 @@ jobs:
               'disable_udp_hole_punching = false',
               ''
           ]
-          p.joinpath('config.toml').write_text('\n'.join(cfg))
+
+          config_text = '\n'.join(cfg)
+          p.joinpath('config.toml').write_text(config_text)
           p.joinpath('config.toml').chmod(0o600)
+
+          # Local structural validation. This catches malformed peer URIs before QEMU starts.
+          parsed = re.findall(r'^uri\s*=\s*"([^"]+)"$', config_text, re.MULTILINE)
+          if not parsed:
+              raise SystemExit('no EasyTier peer URI was generated')
+          for peer in parsed:
+              u = urlsplit(peer)
+              if u.scheme not in {'tcp', 'udp', 'wg', 'ws', 'wss'} or not u.hostname:
+                  raise SystemExit(f'invalid generated EasyTier peer URI: {peer!r}')
+              try:
+                  port = u.port
+              except ValueError as exc:
+                  raise SystemExit(f'invalid generated EasyTier peer port: {peer!r}') from exc
+              if port is None or not 1 <= port <= 65535:
+                  raise SystemExit(f'invalid generated EasyTier peer port: {peer!r}')
+
+          print('--- EasyTier peer URI(s), normalized ---')
+          for peer in parsed:
+              print(peer)
           PY
           cloud-localds seed.iso user-data meta-data
           echo '--- EasyTier config (secret masked) ---'
