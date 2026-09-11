@@ -1,32 +1,7 @@
-# =============================================================================
-#  Debian 13 (trixie) QEMU/KVM + EasyTier 出口节点
-# -----------------------------------------------------------------------------
-#  点击 Run workflow 即可，无需任何输入。
-#
-#  仓库 Secrets（Settings → Secrets and variables → Actions）：
-#    DEBIAN_ROOT_PASSWORD     VM 用户 NvdAdmin 的密码；留空则自动生成
-#    EASYTIER_NETWORK_NAME    EasyTier 网络名
-#    EASYTIER_NETWORK_SECRET  EasyTier 网络密钥
-#    EASYTIER_PEER            引导节点 URI（可多个，空格/逗号分隔）
-#                             留空则使用 tcp://public.easytier.cn:11010
-#
-#  固定参数
-#    enable_exit_node          true
-#    easytier_ipv4             10.1.1.51/24
-#    EasyTier 主机名           gh-et
-#    relay_network_whitelist   *   （允许全部网络使用本出口）
-#    foreign_network_whitelist *
-#    private_mode              false
-#    proxy_forward_by_system   true（系统内核转发，关闭内置 NAT / smoltcp）
-#    VM 规格                   按 runner 实测取 GitHub 免费额度最大值
-#                              公开仓 ubuntu-latest：4 vCPU / 16 GB / ~14 GB+
-#    保活                      330 分钟（job 上限 360）
-# =============================================================================
-
 name: Debian 13 QEMU/KVM + EasyTier (exit-node)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -42,690 +17,206 @@ env:
   ET_HOSTNAME: gh-et
   ET_IPV4: '10.1.1.51/24'
   ET_VERSION: latest
-  ENABLE_EXIT_NODE: 'true'
-  PROXY_FORWARD_BY_SYSTEM: 'true'
-  USE_SMOLTCP: 'false'
-  RELAY_WHITELIST: '*'
   KEEP_ALIVE_MINUTES: '330'
 
 jobs:
   debian-kvm:
-    name: Boot Debian 13 VM and join EasyTier
     runs-on: ubuntu-latest
     timeout-minutes: 360
-
     env:
       ET_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
       ET_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
-      ET_PEER_SECRET: ${{ secrets.EASYTIER_PEER }}
-      VM_PASSWORD_SECRET: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+      ET_PEER: ${{ secrets.EASYTIER_PEER }}
+      VM_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
 
     steps:
-      - name: Preflight / 自动取 runner 最大规格
-        id: hw
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo '== runner =='
-          nproc
-          free -h
-          df -hT / /mnt 2>/dev/null || df -hT /
-          uname -a
-
-          echo '== kvm =='
-          if [ -e /dev/kvm ]; then
-            ls -l /dev/kvm
-          else
-            echo '/dev/kvm 不存在'
-          fi
-          grep -o -m1 -E 'vmx|svm' /proc/cpuinfo || echo 'CPU 无 vmx/svm'
-
-          # 公开仓免费 runner：4C / 16G；私有：2C / 8G。全部给客机，仅预留宿主机。
-          VM_CPUS="$(nproc)"
-          MEM_TOTAL_MB="$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)"
-          if [ "$MEM_TOTAL_MB" -ge 14000 ]; then
-            HOST_RESERVE_MB=2048
-          else
-            HOST_RESERVE_MB=1536
-          fi
-          VM_MEM=$(( MEM_TOTAL_MB - HOST_RESERVE_MB ))
-          if [ "$VM_MEM" -lt 2048 ]; then VM_MEM=2048; fi
-
-          avail_g() {
-            df -BG "$1" 2>/dev/null | awk 'NR==2 {gsub(/G/,""); print $4+0}'
-          }
-          ROOT_AVAIL_G="$(avail_g /)"
-          MNT_AVAIL_G="$(avail_g /mnt)"
-          ROOT_AVAIL_G="${ROOT_AVAIL_G:-0}"
-          MNT_AVAIL_G="${MNT_AVAIL_G:-0}"
-          DISK_ROOT="/"
-          if [ "$MNT_AVAIL_G" -gt "$ROOT_AVAIL_G" ]; then
-            DISK_ROOT="/mnt"
-          fi
-          AVAIL_G="$(avail_g "$DISK_ROOT")"
-          AVAIL_G="${AVAIL_G:-8}"
-          # qcow2 稀疏分配：虚拟容量吃满剩余空间，宿主机预留 3G
-          VM_DISK_G=$(( AVAIL_G - 3 ))
-          if [ "$VM_DISK_G" -lt 8 ]; then VM_DISK_G=8; fi
-
-          WORK_DIR="${DISK_ROOT}/cst-debian-vm"
-          sudo mkdir -p "$WORK_DIR"
-          sudo chown "$(id -u):$(id -g)" "$WORK_DIR"
-
-          {
-            echo "VM_CPUS=${VM_CPUS}"
-            echo "VM_MEM=${VM_MEM}"
-            echo "VM_DISK=${VM_DISK_G}G"
-            echo "DISK_ROOT=${DISK_ROOT}"
-            echo "WORK_DIR=${WORK_DIR}"
-          } >> "$GITHUB_ENV"
-
-          echo "::notice::VM 规格 cpus=${VM_CPUS} memory=${VM_MEM}MB disk=${VM_DISK_G}G work=${WORK_DIR} (host mem=${MEM_TOTAL_MB}MB avail=${AVAIL_G}G)"
-
-          if [ -z "${ET_NETWORK_NAME:-}" ] || [ -z "${ET_NETWORK_SECRET:-}" ]; then
-            echo '::error::请配置仓库 Secret：EASYTIER_NETWORK_NAME 与 EASYTIER_NETWORK_SECRET'
-            exit 1
-          fi
-
-      - name: Enable KVM device permissions
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
-            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
-          sudo udevadm control --reload-rules || true
-          sudo udevadm trigger --name-match=kvm || true
-          sudo chmod 0666 /dev/kvm 2>/dev/null || true
-          ls -l /dev/kvm 2>/dev/null || echo '/dev/kvm 不存在'
-
-      - name: Install QEMU / cloud-init tooling
+      - name: Prepare runner
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-utils cloud-image-utils \
-            sshpass curl ca-certificates jq unzip python3 openssl
-          if [ ! -w /dev/kvm ]; then
-            echo '::warning::/dev/kvm 不可写，将回退 TCG 软件模拟（很慢）'
-          fi
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils sshpass curl ca-certificates jq unzip openssl
+          test -e /dev/kvm || echo '::warning::/dev/kvm not available; QEMU will use TCG'
+          sudo chmod 0666 /dev/kvm 2>/dev/null || true
+          WORK_DIR=/mnt/cst-debian-vm
+          sudo mkdir -p "$WORK_DIR"
+          sudo chown "$USER:$USER" "$WORK_DIR"
+          echo "WORK_DIR=$WORK_DIR" >> "$GITHUB_ENV"
+          echo "VM_CPUS=$(nproc)" >> "$GITHUB_ENV"
+          MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+          [ "$MEM_MB" -gt 4096 ] && MEM_MB=$((MEM_MB-1536))
+          echo "VM_MEM=${MEM_MB}" >> "$GITHUB_ENV"
+          [ -n "${ET_NETWORK_NAME:-}" ] && [ -n "${ET_NETWORK_SECRET:-}" ] || { echo '::error::EASYTIER_NETWORK_NAME and EASYTIER_NETWORK_SECRET are required'; exit 1; }
 
-      - name: Download Debian 13 image and EasyTier
+      - name: Download Debian and EasyTier
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
+          curl -fL --retry 5 -o debian.qcow2 'https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2'
+          qemu-img resize debian.qcow2 20G
+          JSON=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' https://api.github.com/repos/EasyTier/EasyTier/releases/latest)
+          ET_URL=$(printf '%s' "$JSON" | jq -r '.assets[].browser_download_url' | grep -E 'easytier-linux-x86_64-v?.*\.zip$' | grep -v -E 'gui|sha256' | head -n1)
+          [ -n "$ET_URL" ] || { echo '::error::EasyTier x86_64 release asset not found'; exit 1; }
+          curl -fL --retry 5 -o easytier.zip "$ET_URL"
+          echo "ET_TAG=$(printf '%s' "$JSON" | jq -r '.tag_name')" >> "$GITHUB_ENV"
 
-          IMG_URL='https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2'
-          curl -fL --retry 5 --retry-delay 5 -o debian.qcow2 "$IMG_URL"
-          qemu-img info debian.qcow2
-          qemu-img resize debian.qcow2 "$VM_DISK"
-          echo "qcow2 on-disk: $(du -h debian.qcow2 | cut -f1) virtual=$VM_DISK"
-
-          AUTH=()
-          if [ -n "${GH_TOKEN:-}" ]; then
-            AUTH=(-H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json')
-          fi
-          API='https://api.github.com/repos/EasyTier/EasyTier/releases/latest'
-          if [ "$ET_VERSION" != 'latest' ]; then
-            API="https://api.github.com/repos/EasyTier/EasyTier/releases/tags/${ET_VERSION}"
-          fi
-          REL_JSON="$(curl -fsSL "${AUTH[@]}" "$API")"
-          ET_TAG="$(printf '%s' "$REL_JSON" | jq -r '.tag_name')"
-          URL="$(printf '%s' "$REL_JSON" | jq -r '.assets[].browser_download_url' \
-            | grep -E 'easytier-linux-x86_64-v?.*\.zip$' | grep -v -E 'gui|sha256' | head -n 1 || true)"
-          if [ -z "$URL" ]; then
-            echo '::error::未找到 EasyTier linux x86_64 zip'
-            echo "$REL_JSON" | jq -r '.assets[].name' || true
-            exit 1
-          fi
-          echo "EasyTier ${ET_TAG} <- $URL"
-          curl -fL --retry 5 --retry-delay 5 -o easytier.zip "$URL"
-          test "$(stat -c%s easytier.zip)" -gt 1000000
-          echo "ET_TAG=${ET_TAG}" >> "$GITHUB_ENV"
-          echo "easytier.zip: $(du -h easytier.zip | cut -f1)"
-
-      - name: Build cloud-init seed and EasyTier configs
+      - name: Build cloud-init and EasyTier config
         shell: bash
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-
-          VM_PASSWORD="${VM_PASSWORD_SECRET:-}"
-          if [ -z "$VM_PASSWORD" ]; then
-            VM_PASSWORD="$(openssl rand -base64 18)"
-            echo '::notice::未设置 DEBIAN_ROOT_PASSWORD，已自动生成随机密码（见 Job Summary）'
-            printf 'GENERATED_PASSWORD=%s\n' "$VM_PASSWORD" > generated.env
-          fi
-          printf '%s' "$VM_PASSWORD" > .vm_password
+          PASS="${VM_PASSWORD:-}"
+          if [ -z "$PASS" ]; then PASS=$(openssl rand -base64 18); fi
+          printf '%s' "$PASS" > .vm_password
           chmod 600 .vm_password
-          openssl passwd -6 "$VM_PASSWORD" | tr -d '\n' > .vm_password_hash
-          chmod 600 .vm_password_hash
-
+          export HASH="$(openssl passwd -6 "$PASS")"
           python3 - <<'PY'
-          import os, re, pathlib
-
-          work = pathlib.Path('.')
-          password_hash = (work / '.vm_password_hash').read_text(encoding='utf-8').strip()
-
-          def toml_str(v: str) -> str:
-              return (v or '').replace('\\', '\\\\').replace('"', '\\"')
-
-          def parse_peers(raw: str):
-              found = re.findall(r'(?:tcp|udp|ws|wss|wg|quic)://[^\s,;]+', raw or '')
-              out = []
-              for u in found:
-                  u = u.rstrip('/')
-                  hostport = u.split('://', 1)[-1].split('/')[0]
-                  if not re.search(r':\d+$', hostport):
-                      u = u + ':11010'
-                  out.append(u)
-              return out or ['tcp://public.easytier.cn:11010']
-
-          vm_user = os.environ.get('VM_USER', 'NvdAdmin')
-          vm_hostname = os.environ.get('VM_HOSTNAME', 'debian-kvm')
-          et_hostname = os.environ.get('ET_HOSTNAME', 'gh-et')
-          ipv4 = (os.environ.get('ET_IPV4') or '10.1.1.51/24').strip()
-          net_name = os.environ.get('ET_NETWORK_NAME') or ''
-          net_secret = os.environ.get('ET_NETWORK_SECRET') or ''
-          peers = parse_peers(os.environ.get('ET_PEER_SECRET') or '')
-          whitelist = os.environ.get('RELAY_WHITELIST') or '*'
-          exit_node = (os.environ.get('ENABLE_EXIT_NODE') or 'true').strip().lower() == 'true'
-          by_sys = (os.environ.get('PROXY_FORWARD_BY_SYSTEM') or 'true').strip().lower() == 'true'
-          smoltcp = (os.environ.get('USE_SMOLTCP') or 'false').strip().lower() == 'true'
-
-          user_data = '\n'.join([
-              '#cloud-config',
-              f'hostname: {vm_hostname}',
-              f'fqdn: {vm_hostname}',
-              'manage_etc_hosts: true',
-              'ssh_pwauth: true',
-              'disable_root: true',
-              'ssh_deletekeys: true',
-              'users:',
-              f'  - name: {vm_user}',
-              '    groups: [sudo]',
-              '    shell: /bin/bash',
-              '    sudo: ALL=(ALL) NOPASSWD:ALL',
-              '    lock_passwd: false',
-              f'    passwd: "{password_hash}"',
-              'package_update: false',
-              'package_upgrade: false',
-              'runcmd:',
-              '  - [systemctl, enable, --now, ssh]',
-              '',
-          ])
-          (work / 'user-data').write_text(user_data, encoding='utf-8')
-          (work / 'meta-data').write_text(
-              f'instance-id: debian-kvm-easytier\nlocal-hostname: {vm_hostname}\n',
-              encoding='utf-8',
-          )
-
-          peer_lines = []
-          for u in peers:
-              peer_lines.extend(['[[peer]]', f'uri = "{toml_str(u)}"', ''])
-
-          cfg_lines = [
-              'instance_name = "default"',
-              f'hostname = "{toml_str(et_hostname)}"',
-              f'dhcp = {"false" if ipv4 else "true"}',
-          ]
-          if ipv4:
-              cfg_lines.append(f'ipv4 = "{toml_str(ipv4)}"')
-          cfg_lines += [
-              'rpc_portal = "127.0.0.1:15888"',
-              'exit_nodes = []',
-              '',
-              'listeners = [',
-              '  "tcp://0.0.0.0:11010",',
-              '  "udp://0.0.0.0:11010",',
-              '  "wg://0.0.0.0:11011",',
-              ']',
-              '',
-              '[network_identity]',
-              f'network_name = "{toml_str(net_name)}"',
-              f'network_secret = "{toml_str(net_secret)}"',
-              '',
-          ]
-          cfg_lines += peer_lines
-          cfg_lines += [
-              '[flags]',
-              'dev_name = "et0"',
-              f'enable_exit_node = {"true" if exit_node else "false"}',
-              f'use_smoltcp = {"true" if smoltcp else "false"}',
-              f'proxy_forward_by_system = {"true" if by_sys else "false"}',
-              f'relay_network_whitelist = "{toml_str(whitelist)}"',
-              'foreign_network_whitelist = "*"',
-              'private_mode = false',
-              'latency_first = true',
-              'multi_thread = true',
-              'enable_encryption = true',
-              'enable_ipv6 = false',
-              'no_tun = false',
-              '',
-          ]
-          (work / 'easytier-config.toml').write_text('\n'.join(cfg_lines), encoding='utf-8')
-          os.chmod(work / 'easytier-config.toml', 0o600)
-
-          (work / 'easytier.service').write_text('\n'.join([
-              '[Unit]',
-              'Description=EasyTier networking daemon',
-              'Documentation=https://easytier.rs',
-              'After=network-online.target',
-              'Wants=network-online.target',
-              '',
-              '[Service]',
-              'Type=simple',
-              'ExecStartPre=-/sbin/modprobe tun',
-              'ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml',
-              'ExecStartPost=/usr/local/sbin/easytier-nat.sh',
-              'Restart=always',
-              'RestartSec=5',
-              'LimitNOFILE=1048576',
-              '',
-              '[Install]',
-              'WantedBy=multi-user.target',
-              '',
-          ]), encoding='utf-8')
-
-          (work / 'easytier-nat.sh').write_text('\n'.join([
-              '#!/usr/bin/env bash',
-              '# 出口节点：内核转发 + iptables MASQUERADE（幂等）',
-              'set -uo pipefail',
-              'ET_IF=et0',
-              'sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true',
-              'sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true',
-              'sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1 || true',
-              'sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1 || true',
-              '',
-              'for _ in $(seq 1 45); do',
-              '  ip link show "$ET_IF" >/dev/null 2>&1 && break',
-              '  sleep 1',
-              'done',
-              'sysctl -w net.ipv4.conf.${ET_IF}.rp_filter=0 >/dev/null 2>&1 || true',
-              '',
-              'OUT_IF="$(ip route get 1.1.1.1 2>/dev/null | awk \'{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}\')"',
-              '[ -n "$OUT_IF" ] || OUT_IF="$(ip route 2>/dev/null | awk \'/^default/ {print $5; exit}\')"',
-              'if [ -z "$OUT_IF" ]; then',
-              '  echo "easytier-nat: 无法确定出口网卡"',
-              '  exit 0',
-              'fi',
-              '',
-              'iptables -t nat -C POSTROUTING -o "$OUT_IF" -j MASQUERADE 2>/dev/null \\',
-              '  || iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE',
-              'iptables -C FORWARD -i "$ET_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null \\',
-              '  || iptables -A FORWARD -i "$ET_IF" -o "$OUT_IF" -j ACCEPT',
-              'iptables -C FORWARD -i "$OUT_IF" -o "$ET_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \\',
-              '  || iptables -A FORWARD -i "$OUT_IF" -o "$ET_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT',
-              'iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \\',
-              '  || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu',
-              '',
-              'echo "easytier-nat: MASQUERADE ${ET_IF} -> ${OUT_IF} ip_forward=$(cat /proc/sys/net/ipv4/ip_forward)"',
-              '',
-          ]), encoding='utf-8')
-
-          (work / 'install-easytier.sh').write_text('\n'.join([
-              '#!/usr/bin/env bash',
-              'set -euo pipefail',
-              'export DEBIAN_FRONTEND=noninteractive',
-              'log() { echo "[easytier-install] $*"; }',
-              '',
-              'modprobe tun 2>/dev/null || true',
-              'mkdir -p /dev/net',
-              'if [ ! -c /dev/net/tun ]; then',
-              '  mknod /dev/net/tun c 10 200 || true',
-              '  chmod 0666 /dev/net/tun || true',
-              'fi',
-              '',
-              'apt-get update -y',
-              'apt-get install -y --no-install-recommends iptables iproute2 unzip jq ca-certificates curl iputils-ping',
-              '',
-              'install -d -m 0755 /opt/easytier',
-              'unzip -o -j /tmp/easytier.zip -d /opt/easytier',
-              'chmod +x /opt/easytier/easytier-* 2>/dev/null || true',
-              'test -x /opt/easytier/easytier-core',
-              '/opt/easytier/easytier-core --version || true',
-              '',
-              'install -m 0600 /tmp/easytier-config.toml /opt/easytier/config.toml',
-              'install -m 0755 /tmp/easytier-nat.sh /usr/local/sbin/easytier-nat.sh',
-              'install -m 0644 /tmp/easytier.service /etc/systemd/system/easytier.service',
-              '',
-              'cat > /etc/sysctl.d/99-easytier-exit-node.conf <<EOF',
-              'net.ipv4.ip_forward = 1',
-              'net.ipv6.conf.all.forwarding = 1',
-              'net.ipv4.conf.all.rp_filter = 0',
-              'net.ipv4.conf.default.rp_filter = 0',
-              'EOF',
-              'sysctl --system >/dev/null 2>&1 || true',
-              'sysctl -w net.ipv4.ip_forward=1 || true',
-              '',
-              'systemctl daemon-reload',
-              'systemctl enable easytier.service',
-              'systemctl restart easytier.service',
-              'log "EasyTier 已启动"',
-              '/usr/local/sbin/easytier-nat.sh || true',
-              '',
-          ]), encoding='utf-8')
-          os.chmod(work / 'install-easytier.sh', 0o755)
-          os.chmod(work / 'easytier-nat.sh', 0o755)
-
-          print('user-data + easytier configs written')
-          print('  peers:', peers)
-          print('  hostname:', et_hostname, 'ipv4:', ipv4)
+          import os, pathlib, re, textwrap
+          p=pathlib.Path('.')
+          user=os.environ.get('VM_USER','NvdAdmin')
+          host=os.environ.get('VM_HOSTNAME','debian-kvm')
+          h=os.environ['HASH']
+          ud=textwrap.dedent(f'''\
+          #cloud-config
+          hostname: {host}
+          fqdn: {host}
+          manage_etc_hosts: true
+          ssh_pwauth: true
+          disable_root: true
+          users:
+            - name: {user}
+              groups: [sudo]
+              shell: /bin/bash
+              sudo: ALL=(ALL) NOPASSWD:ALL
+              lock_passwd: false
+              passwd: "{h}"
+          runcmd:
+            - [systemctl, enable, --now, ssh]
+          ''')
+          p.joinpath('user-data').write_text(ud)
+          p.joinpath('meta-data').write_text('instance-id: cst-debian-kvm\nlocal-hostname: '+host+'\n')
+          esc=lambda x: (x or '').replace('\\','\\\\').replace('"','\\"')
+          name=esc(os.environ['ET_NETWORK_NAME'])
+          secret=esc(os.environ['ET_NETWORK_SECRET'])
+          peer=os.environ.get('ET_PEER','')
+          peers=re.findall(r'(?:tcp|udp|ws|wss|wg|quic)://[^\\s,;]+',peer) or ['tcp://public.easytier.cn:11010']
+          pl=[]
+          for x in peers:
+              x=x.rstrip('/')
+              if not re.search(r':\\d+$',x): x += ':11010'
+              pl += ['[[peer]]',f'uri = "{esc(x)}"','']
+          cfg=['instance_name = "default"','hostname = "gh-et"','dhcp = false','ipv4 = "10.1.1.51/24"','rpc_portal = "127.0.0.1:15888"','exit_nodes = []','','listeners = [','  "tcp://0.0.0.0:11010",','  "udp://0.0.0.0:11010",','  "wg://0.0.0.0:11011",',']','','[network_identity]',f'network_name = "{name}"',f'network_secret = "{secret}"','']+pl+['[flags]','dev_name = "et0"','enable_exit_node = true','use_smoltcp = false','proxy_forward_by_system = true','relay_network_whitelist = "*"','foreign_network_whitelist = "*"','private_mode = false','latency_first = true','multi_thread = true','enable_encryption = true','enable_ipv6 = false','no_tun = false','']
+          p.joinpath('config.toml').write_text('\n'.join(cfg)); p.joinpath('config.toml').chmod(0o600)
           PY
+          cloud-localds seed.iso user-data meta-data
 
-          cloud-localds -v seed.iso user-data meta-data
-          echo "seed.iso: $(du -h seed.iso | cut -f1)"
-          head -1 user-data | grep -qx '#cloud-config'
-          grep -q '^hostname = "gh-et"' easytier-config.toml
-          grep -q '^enable_exit_node = true' easytier-config.toml
-          grep -q '^proxy_forward_by_system = true' easytier-config.toml
-          grep -q '^use_smoltcp = false' easytier-config.toml
-          grep -q '^relay_network_whitelist = "\*"' easytier-config.toml
-          grep -q '^private_mode = false' easytier-config.toml
-          grep -q '10.1.1.51/24' easytier-config.toml
-          echo 'config checks passed'
-          echo '----- easytier-config.toml (redacted) -----'
-          sed -E 's/(network_name|network_secret).*/\1 = ***/' easytier-config.toml
-
-      - name: Start QEMU VM
+      - name: Start QEMU KVM
         shell: bash
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          mkdir -p logs
-
-          if [ -w /dev/kvm ]; then
-            ACCEL='-machine q35,accel=kvm,usb=off -enable-kvm -cpu host'
-            echo '使用 KVM 硬件加速'
-          else
-            ACCEL='-machine q35,usb=off -cpu max'
-            echo '::warning::/dev/kvm 不可用，回退 TCG'
-          fi
-
-          # shellcheck disable=SC2086
-          nohup qemu-system-x86_64 \
-            $ACCEL \
-            -name "$VM_HOSTNAME" \
-            -smp "$VM_CPUS" \
-            -m "$VM_MEM" \
-            -object rng-random,id=rng0,filename=/dev/urandom \
-            -device virtio-rng-pci,rng=rng0 \
-            -drive file=debian.qcow2,format=qcow2,if=virtio,discard=unmap,cache=writeback \
-            -drive file=seed.iso,format=raw,if=virtio,readonly=on \
-            -netdev user,id=net0,hostfwd=tcp::${HOST_SSH_PORT}-:22 \
-            -device virtio-net-pci,netdev=net0,romfile= \
-            -display none \
-            -monitor none \
-            -serial file:logs/serial.log \
-            >logs/qemu.log 2>&1 &
+          if [ -w /dev/kvm ]; then ACCEL=(-machine q35,accel=kvm -enable-kvm -cpu host); else ACCEL=(-machine q35 -cpu max); fi
+          nohup qemu-system-x86_64 "${ACCEL[@]}" -name "$VM_HOSTNAME" -smp "$VM_CPUS" -m "$VM_MEM" -drive file=debian.qcow2,format=qcow2,if=virtio -drive file=seed.iso,format=raw,if=virtio,readonly=on -netdev user,id=n0,hostfwd=tcp::${HOST_SSH_PORT}-:22 -device virtio-net-pci,netdev=n0 -display none -serial file:serial.log >qemu.log 2>&1 &
           echo $! > qemu.pid
-          sleep 5
-          if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
-            echo '::error::QEMU 启动后立即退出'
-            cat logs/qemu.log || true
-            exit 1
-          fi
-          echo "QEMU PID=$(cat qemu.pid) smp=${VM_CPUS} mem=${VM_MEM} disk=${VM_DISK} work=${WORK_DIR}"
 
-      - name: Wait for SSH
+      - name: Wait for initial SSH
         shell: bash
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          VM_PASSWORD="$(cat .vm_password)"
-          ssh_base=(sshpass -p "$VM_PASSWORD" ssh
-                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-                    -o ConnectTimeout=10 -o LogLevel=ERROR
-                    -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1)
-          for i in $(seq 1 180); do
-            if "${ssh_base[@]}" 'echo READY' 2>/dev/null; then
-              echo "SSH 就绪（第 ${i} 次探测）"
-              exit 0
-            fi
+          P=$(cat .vm_password)
+          for i in $(seq 1 120); do
+            if sshpass -p "$P" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'echo ready' 2>/dev/null; then exit 0; fi
             sleep 5
           done
-          echo '::error::SSH 连接超时'
-          tail -80 logs/qemu.log || true
-          tail -80 logs/serial.log || true
+          tail -100 qemu.log || true
+          tail -100 serial.log || true
           exit 1
 
-      - name: Wait for cloud-init then install EasyTier
+      - name: Install EasyTier and expose SSH 2222
         shell: bash
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          VM_PASSWORD="$(cat .vm_password)"
-
-          ssh_base=(sshpass -p "$VM_PASSWORD" ssh
-                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-                    -o ConnectTimeout=20 -o LogLevel=ERROR
-                    -o ServerAliveInterval=15
-                    -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1)
-
-          scp_base=(sshpass -p "$VM_PASSWORD" scp
-                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-                    -o LogLevel=ERROR
-                    -P "$HOST_SSH_PORT")
-
-          cat > wait-init.sh <<'RSH'
+          P=$(cat .vm_password)
+          ssh_cmd=(sshpass -p "$P" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1")
+          scp_cmd=(sshpass -p "$P" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$HOST_SSH_PORT")
+          cat > install.sh <<'SH'
           set -euo pipefail
-          echo "cloud-init $(cloud-init --version 2>/dev/null || true)"
-          for i in $(seq 1 240); do
-            s="$(cloud-init status 2>/dev/null | awk '/^status:/ {print $2; exit}')"
-            echo "cloud-init status=${s:-unknown} (${i}/240)"
-            case "${s:-}" in
-              done|disabled|error) break ;;
-            esac
-            sleep 5
-          done
-          cloud-init status --long || true
-          s="$(cloud-init status 2>/dev/null | awk '/^status:/ {print $2; exit}')"
-          if [ "$s" = 'running' ]; then
-            echo 'cloud-init 仍在 running，继续安装 EasyTier'
-            tail -n 40 /var/log/cloud-init-output.log || true
-          fi
-          RSH
-          "${ssh_base[@]}" 'sudo -n tee /tmp/wait-init.sh >/dev/null && sudo -n bash /tmp/wait-init.sh' < wait-init.sh
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends iptables iproute2 unzip ca-certificates curl iputils-ping openssh-server
+          sudo install -d -m 0755 /opt/easytier
+          sudo unzip -o -j /tmp/easytier.zip -d /opt/easytier
+          sudo chmod +x /opt/easytier/easytier-*
+          sudo install -m 0600 /tmp/config.toml /opt/easytier/config.toml
+          sudo tee /etc/ssh/sshd_config.d/99-cst-ssh.conf >/dev/null <<'EOF'
+          Port 22
+          Port 2222
+          ListenAddress 0.0.0.0
+          ListenAddress ::
+          PasswordAuthentication yes
+          PermitRootLogin no
+          EOF
+          sudo sshd -t
+          sudo systemctl enable --now ssh
+          sudo systemctl restart ssh
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+          sudo tee /etc/sysctl.d/99-cst-easytier.conf >/dev/null <<'EOF'
+          net.ipv4.ip_forward=1
+          net.ipv4.conf.all.rp_filter=0
+          net.ipv4.conf.default.rp_filter=0
+          EOF
+          sudo tee /etc/systemd/system/easytier.service >/dev/null <<'EOF'
+          [Unit]
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          ExecStartPre=-/sbin/modprobe tun
+          ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml
+          Restart=always
+          RestartSec=3
+          LimitNOFILE=1048576
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now easytier
+          for i in $(seq 1 60); do ip link show et0 >/dev/null 2>&1 && break; sleep 2; done
+          OUT=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+          sudo iptables -C INPUT -p tcp --dport 2222 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -p tcp --dport 2222 -j ACCEPT
+          sudo iptables -C INPUT -i et0 -p tcp --dport 2222 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -i et0 -p tcp --dport 2222 -j ACCEPT
+          sudo iptables -C FORWARD -i et0 -o "$OUT" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i et0 -o "$OUT" -j ACCEPT
+          sudo iptables -C FORWARD -i "$OUT" -o et0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i "$OUT" -o et0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          sudo iptables -t nat -C POSTROUTING -o "$OUT" -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -o "$OUT" -j MASQUERADE
+          SH
+          "${scp_cmd[@]}" easytier.zip config.toml "$VM_USER@127.0.0.1:/tmp/"
+          "${scp_cmd[@]}" install.sh "$VM_USER@127.0.0.1:/tmp/install.sh"
+          "${ssh_cmd[@]}" 'sudo bash /tmp/install.sh'
 
-          "${scp_base[@]}" \
-            easytier.zip easytier-config.toml easytier.service easytier-nat.sh install-easytier.sh \
-            "$VM_USER@127.0.0.1:/tmp/"
-
-          "${ssh_base[@]}" 'sudo -n bash /tmp/install-easytier.sh'
-
-          cat > wait-et.sh <<'RSH'
-          set -euo pipefail
-          for i in $(seq 1 60); do
-            if systemctl is-active --quiet easytier; then
-              echo "easytier active (${i})"
-              break
-            fi
-            echo "easytier not active (${i}/60)"
-            sleep 2
-          done
-          if ! systemctl is-active --quiet easytier; then
-            journalctl -u easytier -n 200 --no-pager || true
-            exit 1
-          fi
-          for i in $(seq 1 45); do
-            ip link show et0 >/dev/null 2>&1 && break
-            sleep 1
-          done
-          /usr/local/sbin/easytier-nat.sh || true
-          ip -brief addr || true
-          ip link show et0 || true
-          RSH
-          "${ssh_base[@]}" 'sudo -n tee /tmp/wait-et.sh >/dev/null && sudo -n bash /tmp/wait-et.sh' < wait-et.sh
-
-      - name: Verify EasyTier + exit-node
+      - name: Verify EasyTier exit node and SSH 2222
         shell: bash
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          VM_PASSWORD="$(cat .vm_password)"
-          ssh_base=(sshpass -p "$VM_PASSWORD" ssh
-                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-                    -o ConnectTimeout=15 -o LogLevel=ERROR
-                    -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1)
-          cat > verify.sh <<'RSH'
+          P=$(cat .vm_password)
+          sshpass -p "$P" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'sudo bash -s' <<'SH'
           set -e
-          ET=/opt/easytier
-          echo '===== config.toml flags ====='
-          grep -Eq '^enable_exit_node = true' "$ET/config.toml"
-          grep -Eq '^proxy_forward_by_system = true' "$ET/config.toml"
-          grep -Eq '^use_smoltcp = false' "$ET/config.toml"
-          grep -Eq '^hostname = "gh-et"' "$ET/config.toml"
-          grep -Eq '^relay_network_whitelist = "\*"' "$ET/config.toml"
-          grep -Eq '^private_mode = false' "$ET/config.toml"
-          grep -Fq '10.1.1.51/24' "$ET/config.toml"
-          echo 'config.toml flags  [OK]'
-
-          echo '===== wait et0 10.1.1.51 ====='
-          ok=0
-          for i in $(seq 1 40); do
-            if ip -4 addr show et0 2>/dev/null | grep -q '10.1.1.51'; then
-              echo "et0 has 10.1.1.51 (${i})"
-              ok=1
-              break
-            fi
-            echo "waiting et0 10.1.1.51 (${i}/40)"
-            sleep 3
-          done
-          if [ "$ok" != 1 ]; then
-            echo '::error::et0 未拿到 10.1.1.51'
-            ip -brief addr || true
-            journalctl -u easytier -n 120 --no-pager || true
-            "$ET/easytier-cli" node || true
-            exit 1
-          fi
-
-          echo '===== easytier-cli node ====='
-          "$ET/easytier-cli" node || true
-          echo '===== easytier-cli peer ====='
-          "$ET/easytier-cli" peer || true
-          echo '===== easytier-cli route ====='
-          "$ET/easytier-cli" route || true
-
-          test "$(cat /proc/sys/net/ipv4/ip_forward)" = '1'
-          echo 'net.ipv4.ip_forward = 1  [OK]'
-          /usr/local/sbin/easytier-nat.sh || true
+          systemctl is-active --quiet easytier
+          ip -4 addr show et0 | grep -q '10.1.1.51'
+          ss -lnt | grep -Eq ':2222[[:space:]]'
+          iptables -C INPUT -p tcp --dport 2222 -j ACCEPT
+          test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
           iptables -t nat -S | grep -q MASQUERADE
-          echo 'iptables MASQUERADE  [OK]'
-          nproc
-          free -h
-          hostnamectl || true
-          RSH
-          "${ssh_base[@]}" 'sudo -n tee /tmp/verify.sh >/dev/null && sudo -n bash /tmp/verify.sh' < verify.sh
-
-      - name: Connection summary
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR"
-          VM_PASSWORD="$(cat .vm_password)"
-          {
-            echo '## Debian 13 VM + EasyTier 出口节点'
-            echo
-            echo '| 项目 | 值 |'
-            echo '|---|---|'
-            echo "| EasyTier 主机名 | \`gh-et\` |"
-            echo "| 虚拟 IPv4 | \`10.1.1.51/24\` |"
-            echo "| EasyTier 版本 | \`${ET_TAG:-latest}\` |"
-            echo '| Exit node | `true` |'
-            echo '| 内核转发 | `proxy_forward_by_system=true`, `use_smoltcp=false` |'
-            echo '| 出口白名单 | `*`（允许全部网络使用本出口） |'
-            echo "| VM 规格 | ${VM_CPUS} vCPU / ${VM_MEM} MB / ${VM_DISK} |"
-            echo "| 磁盘位置 | \`${WORK_DIR}\` |"
-            echo "| SSH（runner 本机） | \`ssh -p ${HOST_SSH_PORT} ${VM_USER}@127.0.0.1\` |"
-            if [ -f generated.env ]; then
-              echo "| VM 密码 | 自动生成：\`${VM_PASSWORD}\` |"
-            else
-              echo '| VM 密码 | 使用 Secret `DEBIAN_ROOT_PASSWORD` |'
-            fi
-            echo
-            echo '### 客户端走这个出口'
-            echo '```bash'
-            echo "easytier-core -d --network-name '<网络名>' \\"
-            echo "  --network-secret '<密钥>' \\"
-            echo '  --exit-nodes 10.1.1.51'
-            echo '```'
-            echo
-            echo '> GitHub 托管运行器在 NAT 后，入站不可达；节点依靠 EASYTIER_PEER 引导或 UDP 打洞。'
-            echo '> 本 job 会保活约 330 分钟。'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo 'EasyTier exit-node + 10.1.1.51:2222 SSH + NAT: OK'
+          SH
 
       - name: Keep VM alive
         shell: bash
         run: |
-          set -euo pipefail
-          cd "$WORK_DIR"
-          PID="$(cat qemu.pid)"
-          VM_PASSWORD="$(cat .vm_password)"
-          ssh_base=(sshpass -p "$VM_PASSWORD" ssh
-                    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-                    -o ConnectTimeout=10 -o LogLevel=ERROR
-                    -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1)
-          TOTAL="${KEEP_ALIVE_MINUTES}"
-          for i in $(seq 1 "$TOTAL"); do
-            if ! kill -0 "$PID" 2>/dev/null; then
-              echo "::error::QEMU 进程 $PID 已退出"
-              tail -80 logs/qemu.log || true
-              exit 1
-            fi
-            if ! "${ssh_base[@]}" 'sudo -n systemctl is-active --quiet easytier' 2>/dev/null; then
-              echo "[$i/${TOTAL}] easytier 未运行，尝试重启"
-              "${ssh_base[@]}" 'sudo -n systemctl restart easytier' 2>/dev/null || true
-            fi
-            if [ $((i % 10)) -eq 1 ]; then
-              "${ssh_base[@]}" 'sudo -n /opt/easytier/easytier-cli peer || true; ip -brief addr show et0 || true' 2>/dev/null || true
-            fi
-            echo "VM 运行中 ${i}/${TOTAL} 分钟"
-            sleep 60
-          done
-
-      - name: Collect logs
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR" || exit 0
-          mkdir -p logs
-          if [ -f .vm_password ]; then
-            VM_PASSWORD="$(cat .vm_password)"
-            sshpass -p "$VM_PASSWORD" ssh \
-              -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -o ConnectTimeout=10 -o LogLevel=ERROR \
-              -p "$HOST_SSH_PORT" "$VM_USER"@127.0.0.1 \
-              "sudo -n bash -c 'journalctl -u easytier -n 300 --no-pager; echo ===STATUS===; cloud-init status --long; echo ===CFG===; sed -E \"s/(network_name|network_secret).*/\\1 = ***/\" /opt/easytier/config.toml; echo ===NAT===; iptables -t nat -S; echo ===IP===; ip -brief addr'" \
-              > logs/easytier.log 2>&1 || echo '未能从 VM 抓取日志' > logs/easytier.log
-          fi
-          rm -f .vm_password .vm_password_hash easytier-config.toml
-
-      - name: Stop VM
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$WORK_DIR" || exit 0
-          if [ -f qemu.pid ]; then
-            PID="$(cat qemu.pid)"
-            kill "$PID" 2>/dev/null || true
-            for _ in $(seq 1 20); do
-              kill -0 "$PID" 2>/dev/null || break
-              sleep 1
-            done
-            kill -9 "$PID" 2>/dev/null || true
-          fi
-
-      - name: Upload debug logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debian-kvm-easytier-logs
-          retention-days: 7
-          if-no-files-found: warn
-          path: |
-            ${{ env.WORK_DIR }}/logs/
+          echo "Debian 13 QEMU/KVM + EasyTier exit node is ready."
+          echo "SSH: ssh -p 2222 ${VM_USER}@10.1.1.51"
+          sleep "${KEEP_ALIVE_MINUTES}m"
