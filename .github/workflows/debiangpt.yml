@@ -1,4 +1,4 @@
-name: Debian 13 QEMU/KVM + EasyTier (exit-node)
+name: Debian 13 QEMU/KVM GPT
 
 on:
   workflow_dispatch:
