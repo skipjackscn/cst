@@ -1,0 +1,861 @@
+# ==============================================================================
+#  Debian 13 (trixie) QEMU/KVM + EasyTier 出口节点
+# ------------------------------------------------------------------------------
+#  启动：Actions → Debian 13 QEMU/KVM + EasyTier (exit-node) → Run workflow
+#        无需填写任何输入。点一次 Run 即可。
+#
+#  需要的 Secrets（Settings → Secrets and variables → Actions）
+#    DEBIAN_ROOT_PASSWORD     VM 用户 NvdAdmin（及 root）的密码；留空则自动生成
+#    EASYTIER_NETWORK_NAME    EasyTier 网络名（必填）
+#    EASYTIER_NETWORK_SECRET  EasyTier 网络密钥（必填）
+#    EASYTIER_PEER            引导节点 URI，可多个，例如：
+#                             tcp://1.2.3.4:11010
+#                             或 -p tcp://1.2.3.4:11010 -p udp://1.2.3.4:11010
+#                             留空则使用官方公共节点
+#
+#  固定参数（无需在 UI 填写）
+#    enable_exit_node            true
+#    easytier_ipv4               10.1.1.51/24
+#    EasyTier 主机名             gh-et
+#    relay_network_whitelist     空（不为其它虚拟网做中继）
+#    proxy_forward_by_system     true（系统内核转发，关闭内置 NAT）
+#    CPU / 内存 / 磁盘           运行时探测 GitHub 托管 runner 的免费上限
+#
+#  客户端走本出口：
+#    easytier-core -d --network-name <名称> --network-secret <密钥> \
+#      --exit-nodes 10.1.1.51
+# ==============================================================================
+
+name: X
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debian-kvm-easytier
+  cancel-in-progress: true
+
+env:
+  VM_USER: NvdAdmin
+  VM_HOSTNAME: gh-et
+  HOST_SSH_PORT: "2222"
+  WORK_DIR: vm
+  ET_HOSTNAME: gh-et
+  ET_IPV4: 10.1.1.51/24
+  ET_VERSION: v2.6.4
+  ENABLE_EXIT_NODE: "true"
+  PROXY_FORWARD_BY_SYSTEM: "true"
+  RELAY_NETWORK_WHITELIST: ""
+  KEEP_ALIVE_MINUTES: "330"
+  REQUIRE_KVM: "true"
+
+jobs:
+  debian-kvm:
+    name: Boot Debian 13 VM and join EasyTier
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      ET_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
+      ET_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
+      ET_PEER_SECRET: ${{ secrets.EASYTIER_PEER }}
+      VM_PASSWORD_SECRET: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
+
+    steps:
+      - name: Preflight / 检查 Secrets 与嵌套虚拟化
+        id: preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== runner =="
+          nproc
+          free -h
+          df -hT
+          echo "== secrets =="
+          if [ -z "${ET_NETWORK_NAME:-}" ] || [ -z "${ET_NETWORK_SECRET:-}" ]; then
+            echo "::error::缺少 Secrets：EASYTIER_NETWORK_NAME / EASYTIER_NETWORK_SECRET"
+            exit 1
+          fi
+          echo "EASYTIER_NETWORK_NAME len=${#ET_NETWORK_NAME}"
+          echo "EASYTIER_NETWORK_SECRET len=${#ET_NETWORK_SECRET}"
+          echo "EASYTIER_PEER len=${#ET_PEER_SECRET}"
+          echo "DEBIAN_ROOT_PASSWORD is set=$([ -n "${VM_PASSWORD_SECRET:-}" ] && echo yes || echo no)"
+
+          echo "== 虚拟化 =="
+          if [ -e /dev/kvm ]; then
+            ls -l /dev/kvm
+            if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+              echo "kvm=available" >> "$GITHUB_OUTPUT"
+            else
+              echo "kvm=permission" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "kvm=missing" >> "$GITHUB_OUTPUT"
+          fi
+          grep -o -m1 -E 'vmx|svm' /proc/cpuinfo || echo "CPU 标志中未看到 vmx/svm"
+
+      - name: Enable KVM device permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules || true
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 0666 /dev/kvm 2>/dev/null || true
+          ls -l /dev/kvm 2>/dev/null || echo "/dev/kvm 不存在"
+
+      - name: Free runner disk (GitHub 免费额度内尽量腾空)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== before =="
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /opt/hostedtoolcache \
+            /usr/lib/jvm \
+            /usr/local/lib/node_modules \
+            /opt/microsoft \
+            /usr/share/miniconda \
+            /usr/local/share/chromium \
+            /usr/local/share/chrome_for_testing \
+            2>/dev/null || true
+          sudo apt-get clean || true
+          sudo docker system prune -af --volumes >/dev/null 2>&1 || true
+          echo "== after =="
+          df -h /
+
+      - name: Install QEMU / cloud-init / sshpass
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            sshpass \
+            curl \
+            ca-certificates \
+            jq \
+            unzip \
+            python3-yaml \
+            openssl \
+            genisoimage
+
+          if [ ! -w /dev/kvm ]; then
+            if [ "${REQUIRE_KVM}" = "true" ]; then
+              echo "::error::/dev/kvm 不可用。GitHub 托管 runner 未提供嵌套虚拟化。"
+              exit 1
+            fi
+            echo "::warning::/dev/kvm 不可用，将回退 TCG（极慢）"
+          fi
+
+      - name: Detect max VM resources
+        id: hw
+        shell: bash
+        run: |
+          set -euo pipefail
+          CPUS="$(nproc)"
+          # 给宿主机内核 + QEMU 进程留 2.5 GiB，其余全部给虚拟机
+          AVAIL_MB="$(awk '/MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo)"
+          RESERVE_MB=2560
+          MEM_MB=$(( AVAIL_MB - RESERVE_MB ))
+          if [ "$MEM_MB" -lt 2048 ]; then MEM_MB=2048; fi
+          MEM_MB=$(( MEM_MB / 128 * 128 ))
+
+          # 磁盘：给宿主机留 8G，其余作为稀疏 qcow2 虚拟容量
+          FREE_G="$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')"
+          DISK_G=$(( FREE_G - 8 ))
+          if [ "$DISK_G" -lt 8 ]; then DISK_G=8; fi
+          if [ "$DISK_G" -gt 64 ]; then DISK_G=64; fi
+
+          echo "cpus=$CPUS" >> "$GITHUB_OUTPUT"
+          echo "memory=$MEM_MB" >> "$GITHUB_OUTPUT"
+          echo "disk=${DISK_G}G" >> "$GITHUB_OUTPUT"
+          echo "VM 资源上限：CPUS=${CPUS}  MEM=${MEM_MB}MB  DISK=${DISK_G}G  (MemAvailable=${AVAIL_MB}MB free=${FREE_G}G)"
+
+      - name: Download Debian 13 cloud image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR/logs"
+          cd "$WORK_DIR"
+          URL="https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+          curl -fL --retry 5 --retry-delay 5 --retry-all-errors -o debian.qcow2 "$URL"
+          qemu-img info debian.qcow2
+          qemu-img resize debian.qcow2 "${{ steps.hw.outputs.disk }}"
+          echo "qcow2 实际占用：$(du -h debian.qcow2 | cut -f1)  虚拟容量：${{ steps.hw.outputs.disk }}"
+
+      - name: Build cloud-init seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
+
+          VM_PASSWORD="${VM_PASSWORD_SECRET:-}"
+          if [ -z "$VM_PASSWORD" ]; then
+            VM_PASSWORD="$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)"
+            echo "::notice::未设置 DEBIAN_ROOT_PASSWORD，已自动生成随机密码（见 Job Summary）"
+            printf '%s\n' "$VM_PASSWORD" > generated.env
+          fi
+          printf '%s' "$VM_PASSWORD" > .vm_password
+          chmod 600 .vm_password
+          PASSWORD_HASH="$(openssl passwd -6 "$VM_PASSWORD")"
+          printf '%s' "$PASSWORD_HASH" > .vm_password_hash
+
+          python3 - <<'PY'
+          import os, pathlib, re, yaml
+
+          password_hash = pathlib.Path(".vm_password_hash").read_text(encoding="utf-8")
+          hostname = os.environ.get("VM_HOSTNAME", "gh-et")
+          user = os.environ.get("VM_USER", "NvdAdmin")
+
+          cfg = {
+              "hostname": hostname,
+              "fqdn": hostname,
+              "manage_etc_hosts": True,
+              "ssh_pwauth": True,
+              "disable_root": False,
+              "ssh_deletekeys": True,
+              "package_update": True,
+              "package_upgrade": False,
+              "packages": [
+                  "openssh-server",
+                  "curl",
+                  "ca-certificates",
+                  "unzip",
+                  "jq",
+                  "sudo",
+                  "iptables",
+                  "iproute2",
+                  "iputils-ping",
+                  "dnsutils",
+                  "procps",
+              ],
+              "users": [
+                  "default",
+                  {
+                      "name": user,
+                      "gecos": user,
+                      "groups": ["sudo"],
+                      "shell": "/bin/bash",
+                      "sudo": ["ALL=(ALL) NOPASSWD:ALL"],
+                      "lock_passwd": False,
+                      "passwd": password_hash,
+                  },
+                  {
+                      "name": "root",
+                      "lock_passwd": False,
+                      "passwd": password_hash,
+                  },
+              ],
+              "write_files": [
+                  {
+                      "path": "/etc/sudoers.d/90-nvdadmin",
+                      "permissions": "0440",
+                      "owner": "root:root",
+                      "content": f"{user} ALL=(ALL) NOPASSWD:ALL\nDefaults:{user} !requiretty\n",
+                  },
+                  {
+                      "path": "/etc/ssh/sshd_config.d/99-cst.conf",
+                      "permissions": "0644",
+                      "content": (
+                          "PasswordAuthentication yes\n"
+                          "PermitRootLogin yes\n"
+                          "KbdInteractiveAuthentication no\n"
+                          "UseDNS no\n"
+                          "ClientAliveInterval 30\n"
+                          "ClientAliveCountMax 120\n"
+                      ),
+                  },
+                  {
+                      "path": "/etc/sysctl.d/99-easytier-exit-node.conf",
+                      "permissions": "0644",
+                      "content": (
+                          "net.ipv4.ip_forward = 1\n"
+                          "net.ipv6.conf.all.forwarding = 1\n"
+                          "net.ipv4.conf.all.rp_filter = 0\n"
+                          "net.ipv4.conf.default.rp_filter = 0\n"
+                      ),
+                  },
+              ],
+              "runcmd": [
+                  ["modprobe", "tun"],
+                  "mkdir -p /dev/net && { [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200; } && chmod 0666 /dev/net/tun",
+                  "sysctl --system || sysctl -w net.ipv4.ip_forward=1",
+                  ["systemctl", "enable", "--now", "ssh"],
+              ],
+              "final_message": "cloud-init done for gh-et",
+          }
+
+          text = "#cloud-config\n" + yaml.safe_dump(
+              cfg, default_flow_style=False, sort_keys=False, allow_unicode=True
+          )
+          pathlib.Path("user-data").write_text(text, encoding="utf-8")
+          loaded = yaml.safe_load(text)
+          assert loaded.get("users"), "users missing"
+          assert loaded.get("write_files"), "write_files missing"
+          print("user-data 生成成功 bytes=", len(text.encode()))
+          print(re.sub(r"(passwd:\s*)\S+", r"\1***", text))
+          PY
+
+          cat > meta-data <<'MDEOF'
+          instance-id: gh-et
+          local-hostname: gh-et
+          MDEOF
+          # cloud-localds 读取的 meta-data 不能带 YAML 块缩进
+          python3 -c "from pathlib import Path; p=Path('meta-data'); t=p.read_text(); p.write_text('\n'.join(l.lstrip() for l in t.splitlines())+'\n')"
+
+          cloud-localds -v seed.iso user-data meta-data
+          echo "seed.iso: $(du -h seed.iso | cut -f1)"
+
+      - name: Start QEMU VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          mkdir -p logs
+
+          if [ -w /dev/kvm ]; then
+            ACCEL=(-machine q35,accel=kvm -enable-kvm -cpu host)
+            echo "使用 KVM 硬件加速"
+          else
+            ACCEL=(-machine q35 -cpu max)
+            echo "::warning::/dev/kvm 不可用，回退到 TCG 软件模拟，启动会非常慢"
+          fi
+
+          nohup qemu-system-x86_64 \
+            "${ACCEL[@]}" \
+            -name "$VM_HOSTNAME" \
+            -smp "${{ steps.hw.outputs.cpus }}" \
+            -m "${{ steps.hw.outputs.memory }}" \
+            -drive file=debian.qcow2,format=qcow2,if=virtio,discard=unmap,cache=writeback \
+            -drive file=seed.iso,format=raw,if=virtio,readonly=on \
+            -netdev user,id=net0,hostfwd=tcp::${HOST_SSH_PORT}-:22,hostfwd=tcp::11010-:11010,hostfwd=udp::11010-:11010,hostfwd=udp::11011-:11011 \
+            -device virtio-net-pci,netdev=net0,romfile= \
+            -device virtio-rng-pci \
+            -smbios type=1,serial=ds=nocloud \
+            -display none \
+            -monitor none \
+            -serial file:logs/serial.log \
+            >logs/qemu.log 2>&1 &
+
+          echo $! > qemu.pid
+          sleep 5
+          if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+            echo "::error::QEMU 启动后立即退出"
+            cat logs/qemu.log || true
+            cat logs/serial.log || true
+            exit 1
+          fi
+          echo "QEMU PID: $(cat qemu.pid)  smp=${{ steps.hw.outputs.cpus }}  mem=${{ steps.hw.outputs.memory }}MB"
+
+      - name: Wait for SSH
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+
+          ssh_try() {
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o ConnectTimeout=8 \
+              -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" \
+              "echo READY"
+          }
+
+          for i in $(seq 1 180); do
+            if ssh_try 2>/dev/null; then
+              echo "SSH 就绪（第 ${i} 次探测）"
+              exit 0
+            fi
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "仍在等待 SSH… ${i}/180"
+              tail -5 logs/qemu.log || true
+            fi
+            sleep 5
+          done
+
+          echo "::error::SSH 连接超时"
+          tail -80 logs/qemu.log || true
+          tail -120 logs/serial.log || true
+          exit 1
+
+      - name: Wait for cloud-init + passwordless sudo
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+
+          vm_ssh() {
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o ConnectTimeout=15 \
+              -o ServerAliveInterval=15 \
+              -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" \
+              "$@"
+          }
+
+          echo "== 等待免密 sudo =="
+          sudo_ok=0
+          for i in $(seq 1 90); do
+            if vm_ssh "sudo -n true" 2>/dev/null; then
+              echo "sudo -n 就绪（第 ${i} 次）"
+              sudo_ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$sudo_ok" != "1" ]; then
+            echo "::error::免密 sudo 未就绪。cloud-init 可能未写入 /etc/sudoers.d"
+            vm_ssh "id; ls -l /etc/sudoers.d; cloud-init status --long || true" || true
+            tail -80 logs/serial.log || true
+            exit 1
+          fi
+
+          echo "== 等待 cloud-init 完成 =="
+          if ! vm_ssh "sudo -n cloud-init status --wait --timeout 1200"; then
+            echo "::warning::cloud-init --wait 返回非 0，打印状态后继续"
+            vm_ssh "sudo -n cloud-init status --long || true" || true
+          fi
+          vm_ssh "sudo -n cloud-init status --long || true; hostname; ip -brief addr; sysctl net.ipv4.ip_forward" || true
+
+      - name: Download EasyTier on runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WORK_DIR"
+          cd "$WORK_DIR"
+          ZIP="easytier-linux-x86_64-${ET_VERSION}.zip"
+          URL="https://github.com/EasyTier/EasyTier/releases/download/${ET_VERSION}/${ZIP}"
+          echo "下载 $URL"
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors -o easytier.zip "$URL"
+          sz="$(stat -c%s easytier.zip)"
+          echo "zip size=$sz"
+          if [ "$sz" -lt 1000000 ]; then
+            echo "::error::EasyTier zip 过小，下载失败"
+            exit 1
+          fi
+          unzip -l easytier.zip | head -20
+
+      - name: Install and start EasyTier inside VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+
+          vm_ssh() {
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o ConnectTimeout=20 \
+              -o ServerAliveInterval=15 \
+              -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" \
+              "$@"
+          }
+
+          vm_sudo_script() {
+            # 把本地脚本拷到客户机再 sudo 执行，避免 sshpass/sudo -n 吞 stdin
+            local src="$1"
+            sshpass -p "$VM_PASSWORD" scp \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -P "$HOST_SSH_PORT" \
+              "$src" "$VM_USER@127.0.0.1:/tmp/remote.sh"
+            vm_ssh "sudo -n bash /tmp/remote.sh"
+          }
+
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+
+          def strip_wrap(s: str) -> str:
+              s = (s or "").strip()
+              if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+                  s = s[1:-1]
+              return s
+
+          def toml_str(v: str) -> str:
+              return v.replace("\\", "\\\\").replace('"', '\\"')
+
+          net_name = strip_wrap(os.environ.get("ET_NETWORK_NAME", ""))
+          net_secret = strip_wrap(os.environ.get("ET_NETWORK_SECRET", ""))
+          peer_raw = strip_wrap(os.environ.get("ET_PEER_SECRET", ""))
+          if not net_name or not net_secret:
+              sys.exit("missing EasyTier network name/secret")
+
+          uris = re.findall(r"(?:tcp|udp|ws|wss|wg|quic)://[^\s,;]+", peer_raw)
+          cleaned = []
+          for u in uris:
+              u = u.rstrip("/")
+              if not re.search(r":\d+$", u):
+                  u += ":11010"
+              cleaned.append(u)
+          if not cleaned:
+              cleaned = [
+                  "tcp://public.easytier.cn:11010",
+                  "tcp://public.easytier.top:11010",
+              ]
+              print("EASYTIER_PEER 为空或无法解析，使用官方公共节点")
+          print(f"parsed peer count={len(cleaned)}")
+          for u in cleaned:
+              print(f"  peer len={len(u)}")
+
+          ipv4 = os.environ.get("ET_IPV4", "10.1.1.51/24").strip()
+          hostname = os.environ.get("ET_HOSTNAME", "gh-et").strip() or "gh-et"
+          whitelist = os.environ.get("RELAY_NETWORK_WHITELIST", "")
+          # 保留空字符串：不为其它虚拟网提供中继
+          if whitelist is None:
+              whitelist = ""
+
+          peer_block = "\n".join(
+              f'[[peer]]\nuri = "{toml_str(u)}"\n' for u in cleaned
+          )
+
+          cfg = f"""instance_name = "gh-et"
+          hostname = "{toml_str(hostname)}"
+          ipv4 = "{toml_str(ipv4)}"
+          dhcp = false
+          rpc_portal = "127.0.0.1:15888"
+          listeners = [
+            "tcp://0.0.0.0:11010",
+            "udp://0.0.0.0:11010",
+            "tcp://[::]:11010",
+            "udp://[::]:11010",
+            "wg://0.0.0.0:11011",
+          ]
+
+          [network_identity]
+          network_name = "{toml_str(net_name)}"
+          network_secret = "{toml_str(net_secret)}"
+
+          {peer_block}
+          [flags]
+          dev_name = "et0"
+          enable_exit_node = true
+          use_smoltcp = false
+          proxy_forward_by_system = true
+          relay_network_whitelist = "{toml_str(whitelist)}"
+          private_mode = true
+          latency_first = true
+          multi_thread = true
+          enable_encryption = true
+          no_tun = false
+          """
+          # python 三引号里的缩进需要去掉，否则 TOML 非法
+          lines = []
+          for line in cfg.splitlines():
+              lines.append(line[10:] if line.startswith("          ") else line)
+          pathlib.Path("config.toml").write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+          print("wrote config.toml")
+          PY
+
+          cat > easytier-nat.sh <<'NATSH'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          ET_IF=et0
+          sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+          for _ in $(seq 1 40); do
+            ip link show "$ET_IF" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          OUT_IF="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+          [ -n "$OUT_IF" ] || OUT_IF="$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')"
+          if [ -z "$OUT_IF" ]; then
+            echo "easytier-nat: 无法确定出口网卡"
+            exit 0
+          fi
+          iptables -t nat -C POSTROUTING -o "$OUT_IF" -j MASQUERADE 2>/dev/null \
+            || iptables -t nat -A POSTROUTING -o "$OUT_IF" -j MASQUERADE
+          iptables -C FORWARD -i "$ET_IF" -o "$OUT_IF" -j ACCEPT 2>/dev/null \
+            || iptables -A FORWARD -i "$ET_IF" -o "$OUT_IF" -j ACCEPT
+          iptables -C FORWARD -i "$OUT_IF" -o "$ET_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+            || iptables -A FORWARD -i "$OUT_IF" -o "$ET_IF" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+            || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+          echo "easytier-nat: MASQUERADE ${ET_IF} -> ${OUT_IF}"
+          NATSH
+
+          cat > easytier.service <<'ETSVC'
+          [Unit]
+          Description=EasyTier networking daemon
+          Documentation=https://easytier.rs
+          After=network-online.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStartPre=/sbin/modprobe tun
+          ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml --enable-exit-node --proxy-forward-by-system --relay-network-whitelist
+          ExecStartPost=/usr/local/sbin/easytier-nat.sh
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=1048576
+          AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+
+          [Install]
+          WantedBy=multi-user.target
+          ETSVC
+
+          cat > install-et.sh <<'INST'
+          set -euo pipefail
+          ET_DIR=/opt/easytier
+          mkdir -p "$ET_DIR" /dev/net /var/log/easytier
+          modprobe tun 2>/dev/null || true
+          if [ ! -c /dev/net/tun ]; then
+            mknod /dev/net/tun c 10 200 || true
+            chmod 0666 /dev/net/tun || true
+          fi
+          unzip -o -j /tmp/easytier.zip -d "$ET_DIR"
+          chmod +x "$ET_DIR"/easytier-core "$ET_DIR"/easytier-cli
+          test -x "$ET_DIR/easytier-core"
+          "$ET_DIR/easytier-core" --version || true
+          install -m 0600 /tmp/config.toml "$ET_DIR/config.toml"
+          install -m 0755 /tmp/easytier-nat.sh /usr/local/sbin/easytier-nat.sh
+          install -m 0644 /tmp/easytier.service /etc/systemd/system/easytier.service
+          sysctl --system >/dev/null 2>&1 || true
+          sysctl -w net.ipv4.ip_forward=1 || true
+          systemctl daemon-reload
+          systemctl enable easytier.service
+          systemctl restart easytier.service
+          sleep 3
+          systemctl is-active easytier.service
+          INST
+
+          python3 - <<'PY'
+          from pathlib import Path
+          for name in ("easytier-nat.sh", "easytier.service", "install-et.sh"):
+              p = Path(name)
+              lines = [ln[10:] if ln.startswith("          ") else ln for ln in p.read_text().splitlines()]
+              p.write_text("\n".join(lines).rstrip() + "\n")
+          PY
+
+          echo "== 传输二进制与配置 =="
+          sshpass -p "$VM_PASSWORD" scp \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o PreferredAuthentications=password \
+            -o PubkeyAuthentication=no \
+            -P "$HOST_SSH_PORT" \
+            easytier.zip config.toml easytier-nat.sh easytier.service \
+            "$VM_USER@127.0.0.1:/tmp/"
+
+          vm_sudo_script install-et.sh
+
+          echo "== 等待 et0 / 虚拟 IP =="
+          cat > wait-et.sh <<'WSH'
+          set -euo pipefail
+          for i in $(seq 1 40); do
+            if systemctl is-active --quiet easytier.service && ip link show et0 >/dev/null 2>&1; then
+              /usr/local/sbin/easytier-nat.sh || true
+              echo "et0 已出现 (round $i)"
+              ip -brief addr
+              exit 0
+            fi
+            echo "[$i/40] waiting et0, active=$(systemctl is-active easytier.service || true)"
+            sleep 3
+          done
+          journalctl -u easytier -n 200 --no-pager || true
+          cat /opt/easytier/config.toml || true
+          exit 1
+          WSH
+          python3 -c "from pathlib import Path; p=Path('wait-et.sh'); p.write_text('\n'.join(l[10:] if l.startswith('          ') else l for l in p.read_text().splitlines()).rstrip()+'\n')"
+          vm_sudo_script wait-et.sh
+
+      - name: Verify EasyTier + exit-node
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+
+          vm_ssh() {
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o ConnectTimeout=15 \
+              -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" \
+              "$@"
+          }
+          vm_sudo_script() {
+            sshpass -p "$VM_PASSWORD" scp \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -P "$HOST_SSH_PORT" \
+              "$1" "$VM_USER@127.0.0.1:/tmp/remote.sh"
+            vm_ssh "sudo -n bash /tmp/remote.sh"
+          }
+
+          cat > verify.sh <<'RSH'
+          set -euo pipefail
+          ET=/opt/easytier
+          echo "===== hostname ====="
+          hostname
+          echo "===== config (redacted) ====="
+          sed -E 's/(network_name|network_secret) *=.*/\1 = ***/' "$ET/config.toml"
+          echo "===== easytier-cli node ====="
+          "$ET/easytier-cli" --rpc-portal 127.0.0.1:15888 node || true
+          echo "===== easytier-cli peer ====="
+          "$ET/easytier-cli" --rpc-portal 127.0.0.1:15888 peer || true
+          echo "===== easytier-cli route ====="
+          "$ET/easytier-cli" --rpc-portal 127.0.0.1:15888 route || true
+          grep -Eq '^enable_exit_node = true' "$ET/config.toml"
+          grep -Eq '^proxy_forward_by_system = true' "$ET/config.toml"
+          grep -Eq '^hostname = "gh-et"' "$ET/config.toml"
+          grep -Eq '^ipv4 = "10.1.1.51/24"' "$ET/config.toml"
+          test "$(cat /proc/sys/net/ipv4/ip_forward)" = "1"
+          /usr/local/sbin/easytier-nat.sh || true
+          iptables -t nat -S | grep -q MASQUERADE
+          echo "exit-node / kernel-forward / NAT 检查通过"
+          RSH
+          python3 -c "from pathlib import Path; p=Path('verify.sh'); p.write_text('\n'.join(l[10:] if l.startswith('          ') else l for l in p.read_text().splitlines()).rstrip()+'\n')"
+          vm_sudo_script verify.sh
+
+      - name: Connection summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+          {
+            echo "## Debian 13 VM + EasyTier 出口节点"
+            echo
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| EasyTier 主机名 | \`gh-et\` |"
+            echo "| 虚拟 IPv4 | \`10.1.1.51/24\` |"
+            echo "| 版本 | \`${ET_VERSION}\` |"
+            echo "| Exit node | \`true\` |"
+            echo "| 内核转发 | \`true\` |"
+            echo "| 中继白名单 | （空，不为其它虚拟网中继） |"
+            echo "| VM 用户 | \`${VM_USER}\` |"
+            echo "| CPU | \`${{ steps.hw.outputs.cpus }}\` |"
+            echo "| 内存 | \`${{ steps.hw.outputs.memory }} MB\` |"
+            echo "| 磁盘 | \`${{ steps.hw.outputs.disk }}\` |"
+            if [ -f generated.env ]; then
+              echo "| VM 密码 | 自动生成：\`${VM_PASSWORD}\` |"
+            else
+              echo "| VM 密码 | Secret \`DEBIAN_ROOT_PASSWORD\` |"
+            fi
+            echo
+            echo "### 客户端如何走这个出口"
+            echo '```bash'
+            echo "easytier-core -d --network-name '${ET_NETWORK_NAME}' \\"
+            echo "  --network-secret '<你的密钥>' \\"
+            echo "  --exit-nodes 10.1.1.51"
+            echo '```'
+            echo
+            echo "> GitHub 托管运行器位于 NAT 之后，公网入站不可达；"
+            echo "> 节点依靠 \`EASYTIER_PEER\` 或 UDP 打洞与客户端建立连接。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep VM alive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR"
+          VM_PASSWORD="$(cat .vm_password)"
+          PID="$(cat qemu.pid)"
+          TOTAL="${KEEP_ALIVE_MINUTES}"
+          for i in $(seq 1 "$TOTAL"); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              echo "::error::QEMU 进程 $PID 已退出"
+              tail -80 logs/qemu.log || true
+              exit 1
+            fi
+            if [ $((i % 10)) -eq 0 ]; then
+              sshpass -p "$VM_PASSWORD" ssh \
+                -o StrictHostKeyChecking=no \
+                -o UserKnownHostsFile=/dev/null \
+                -o PreferredAuthentications=password \
+                -o PubkeyAuthentication=no \
+                -o ConnectTimeout=8 \
+                -o LogLevel=ERROR \
+                -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" \
+                "sudo -n systemctl is-active easytier.service && sudo -n /opt/easytier/easytier-cli --rpc-portal 127.0.0.1:15888 node || true" \
+                || echo "heartbeat ssh 失败（第 ${i} 分钟）"
+            fi
+            echo "VM 运行中 ${i}/${TOTAL} 分钟"
+            sleep 60
+          done
+
+      - name: Collect logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR" || exit 0
+          mkdir -p logs
+          if [ -f .vm_password ]; then
+            VM_PASSWORD="$(cat .vm_password)"
+            sshpass -p "$VM_PASSWORD" ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o ConnectTimeout=10 \
+              -o LogLevel=ERROR \
+              -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" \
+              "sudo -n bash -c 'journalctl -u easytier -n 300 --no-pager; echo ===CONFIG===; sed -E \"s/(network_name|network_secret) *=.*/\\1 = ***/\" /opt/easytier/config.toml; echo ===CI===; cloud-init status --long; echo ===IPT===; iptables -t nat -S; echo ===IP===; ip addr'" \
+              > logs/easytier.log 2>&1 || echo "未能从 VM 抓取日志" >> logs/easytier.log
+          fi
+          rm -f .vm_password .vm_password_hash
+
+      - name: Stop VM
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$WORK_DIR" || exit 0
+          if [ -f qemu.pid ]; then
+            PID="$(cat qemu.pid)"
+            kill "$PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$PID" 2>/dev/null || break
+              sleep 1
+            done
+            kill -9 "$PID" 2>/dev/null || true
+          fi
+
+      - name: Upload debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debian-kvm-easytier-logs
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ env.WORK_DIR }}/logs/
+            ${{ env.WORK_DIR }}/user-data
