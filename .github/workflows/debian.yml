@@ -102,16 +102,53 @@ jobs:
           name=esc(os.environ['ET_NETWORK_NAME'])
           secret=esc(os.environ['ET_NETWORK_SECRET'])
           peer=os.environ.get('ET_PEER','')
-          peers=re.findall(r'(?:tcp|udp|ws|wss|wg|quic)://[^\\s,;]+',peer) or ['tcp://public.easytier.cn:11010']
+          peers=re.findall(r'(?:tcp|udp|ws|wss|wg|quic)://[^\\s,;]+',peer) or ['tcp://public.easytier.top:11010']
           pl=[]
           for x in peers:
               x=x.rstrip('/')
               if not re.search(r':\\d+$',x): x += ':11010'
               pl += ['[[peer]]',f'uri = "{esc(x)}"','']
-          cfg=['instance_name = "default"','hostname = "gh-et"','dhcp = false','ipv4 = "10.1.1.51/24"','rpc_portal = "127.0.0.1:15888"','exit_nodes = []','','listeners = [','  "tcp://0.0.0.0:11010",','  "udp://0.0.0.0:11010",','  "wg://0.0.0.0:11011",',']','','[network_identity]',f'network_name = "{name}"',f'network_secret = "{secret}"','']+pl+['[flags]','dev_name = "et0"','enable_exit_node = true','use_smoltcp = false','proxy_forward_by_system = true','relay_network_whitelist = "*"','foreign_network_whitelist = "*"','private_mode = false','latency_first = true','multi_thread = true','enable_encryption = true','enable_ipv6 = false','no_tun = false','']
+          cfg=[
+            'instance_name = "default"',
+            'hostname = "gh-et"',
+            'dhcp = false',
+            'ipv4 = "10.1.1.51/24"',
+            'rpc_portal = "127.0.0.1:15888"',
+            'exit_nodes = []',
+            '',
+            'listeners = [',
+            '  "tcp://0.0.0.0:11010",',
+            '  "udp://0.0.0.0:11010",',
+            '  "wg://0.0.0.0:11011",',
+            '  "ws://0.0.0.0:11011/",',
+            '  "wss://0.0.0.0:11012/",',
+            ']',
+            '',
+            '[network_identity]',
+            f'network_name = "{name}"',
+            f'network_secret = "{secret}"',
+            ''
+          ] + pl + [
+            '[flags]',
+            'default_protocol = "tcp"',
+            'dev_name = "et0"',
+            'enable_exit_node = true',
+            'enable_encryption = true',
+            'enable_ipv6 = false',
+            'mtu = 1360',
+            'latency_first = true',
+            'no_tun = false',
+            'use_smoltcp = false',
+            'proxy_forward_by_system = true',
+            'foreign_network_whitelist = "*"',
+            'relay_network_whitelist = "*"',
+            ''
+          ]
           p.joinpath('config.toml').write_text('\n'.join(cfg)); p.joinpath('config.toml').chmod(0o600)
           PY
           cloud-localds seed.iso user-data meta-data
+          echo '--- EasyTier config ---'
+          sed 's/network_secret = .*/network_secret = "***"/' config.toml
 
       - name: Start QEMU KVM
         shell: bash
@@ -146,6 +183,7 @@ jobs:
           scp_cmd=(sshpass -p "$P" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$HOST_SSH_PORT")
           cat > install.sh <<'SH'
           set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends iptables iproute2 unzip ca-certificates curl iputils-ping openssh-server
           sudo install -d -m 0755 /opt/easytier
@@ -165,6 +203,7 @@ jobs:
           sudo systemctl restart ssh
           sudo sysctl -w net.ipv4.ip_forward=1
           sudo sysctl -w net.ipv4.conf.all.rp_filter=0
+          sudo sysctl -w net.ipv4.conf.default.rp_filter=0
           sudo tee /etc/sysctl.d/99-cst-easytier.conf >/dev/null <<'EOF'
           net.ipv4.ip_forward=1
           net.ipv4.conf.all.rp_filter=0
@@ -172,21 +211,34 @@ jobs:
           EOF
           sudo tee /etc/systemd/system/easytier.service >/dev/null <<'EOF'
           [Unit]
-          After=network-online.target
+          Description=EasyTier VPN
           Wants=network-online.target
+          After=network-online.target
           [Service]
+          Type=simple
           ExecStartPre=-/sbin/modprobe tun
           ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml
           Restart=always
           RestartSec=3
           LimitNOFILE=1048576
+          AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+          CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
           [Install]
           WantedBy=multi-user.target
           EOF
           sudo systemctl daemon-reload
-          sudo systemctl enable --now easytier
+          sudo systemctl enable easytier
+          sudo systemctl restart easytier
+          sleep 5
+          echo '--- EasyTier service status ---'
+          sudo systemctl --no-pager --full status easytier || true
+          echo '--- EasyTier journal ---'
+          sudo journalctl -u easytier -n 80 --no-pager || true
+          sudo systemctl is-active --quiet easytier || { echo '::error::EasyTier failed to start'; exit 1; }
           for i in $(seq 1 60); do ip link show et0 >/dev/null 2>&1 && break; sleep 2; done
+          ip link show et0 >/dev/null 2>&1 || { echo '::error::EasyTier et0 was not created'; sudo journalctl -u easytier -n 100 --no-pager; exit 1; }
           OUT=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+          [ -n "$OUT" ] || { echo '::error::WAN interface not detected'; exit 1; }
           sudo iptables -C INPUT -p tcp --dport 2222 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -p tcp --dport 2222 -j ACCEPT
           sudo iptables -C INPUT -i et0 -p tcp --dport 2222 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -i et0 -p tcp --dport 2222 -j ACCEPT
           sudo iptables -C FORWARD -i et0 -o "$OUT" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i et0 -o "$OUT" -j ACCEPT
