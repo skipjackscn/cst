@@ -4,29 +4,31 @@ set -Eeuo pipefail
 # ============================================================
 # skipjackscn/cst - Tailscale Linux AMD64 Exit Node installer
 # ============================================================
-# One-command usage:
-#   curl -fsSL https://raw.githubusercontent.com/skipjackscn/cst/main/scripts/install-tailscale-exit.sh \
-#     | sudo bash -s -- 'tskey-auth-xxxxxxxx'
+#
+# One-command install:
+#   curl -fsSL https://raw.githubusercontent.com/skipjackscn/cst/main/scripts/install-tailscale-exit.sh | sudo bash -s -- 'tskey-auth-xxxxxxxx'
+#
+# GitHub Actions / existing convention in this repository:
+#   TAILSCALE_AUTHKEY='tskey-auth-xxxxxxxx' ...
 #
 # Optional environment variables:
-#   TAILSCALE_TAG=tag:exit-node
-#   TAILSCALE_HOSTNAME=custom-name
-#   TAILSCALE_AUTH_KEY=tskey-auth-xxxxxxxx
+#   TAILSCALE_AUTHKEY   Auth key (preferred repository convention)
+#   TAILSCALE_AUTH_KEY  Alias for TAILSCALE_AUTHKEY
+#   TAILSCALE_TAG       Default: tag:exit-node
+#   TAILSCALE_HOSTNAME  Default: <system-hostname>-exit
 #
-# The Tailnet policy should contain:
-#   "tagOwners": {
-#     "tag:exit-node": ["autogroup:admin"]
-#   },
+# Tailnet policy (one-time setup) for automatic Exit Node approval:
 #   "autoApprovers": {
 #     "exitNode": ["tag:exit-node"]
 #   }
 #
-# This makes the device's exit-node advertisement automatically approved.
+# If your Tailnet already uses a different tag, set TAILSCALE_TAG
+# accordingly. Do not put the Auth Key into this repository.
 # ============================================================
 
-VERSION="1.1.0"
+VERSION="2.0.0"
 TAG="${TAILSCALE_TAG:-tag:exit-node}"
-AUTH_KEY="${1:-${TAILSCALE_AUTH_KEY:-}}"
+AUTH_KEY="${1:-${TAILSCALE_AUTHKEY:-${TAILSCALE_AUTH_KEY:-}}}"
 
 log()  { printf '\n[INFO] %s\n' "$*"; }
 ok()   { printf '[ OK ] %s\n' "$*"; }
@@ -42,11 +44,12 @@ ARCH="$(uname -m)"
 
 [[ -n "$AUTH_KEY" ]] || fail "Tailscale Auth Key is required. Example: sudo bash install-tailscale-exit.sh 'tskey-auth-xxxxx'"
 
+# Generate a safe default hostname unless the caller supplied one.
 if [[ -z "${TAILSCALE_HOSTNAME:-}" ]]; then
-  base="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo linux)"
-  base="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//')"
-  [[ -n "$base" ]] || base="linux"
-  TAILSCALE_HOSTNAME="${base}-exit"
+  BASE_HOST="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo linux)"
+  BASE_HOST="$(printf '%s' "$BASE_HOST" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g; s/^-*//; s/-*$//')"
+  [[ -n "$BASE_HOST" ]] || BASE_HOST="linux"
+  TAILSCALE_HOSTNAME="${BASE_HOST}-exit"
 fi
 
 log "skipjackscn/cst Tailscale Exit Node installer v${VERSION}"
@@ -56,31 +59,27 @@ printf '  Hostname : %s\n' "$TAILSCALE_HOSTNAME"
 printf '  Tag      : %s\n' "$TAG"
 
 # ------------------------------------------------------------
-# Basic dependencies
+# 1. Install basic dependencies
 # ------------------------------------------------------------
-install_deps() {
-  if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y curl ca-certificates iproute2 procps
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y curl ca-certificates iproute procps
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y curl ca-certificates iproute procps
-  elif command -v zypper >/dev/null 2>&1; then
-    zypper --non-interactive install curl ca-certificates iproute2 procps
-  elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm curl ca-certificates iproute2 procps
-  else
-    fail "Unsupported package manager."
-  fi
-}
-
-install_deps
+if command -v apt-get >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y curl ca-certificates iproute2 procps
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y curl ca-certificates iproute procps
+elif command -v yum >/dev/null 2>&1; then
+  yum install -y curl ca-certificates iproute procps
+elif command -v zypper >/dev/null 2>&1; then
+  zypper --non-interactive install curl ca-certificates iproute2 procps
+elif command -v pacman >/dev/null 2>&1; then
+  pacman -Sy --noconfirm curl ca-certificates iproute2 procps
+else
+  fail "Unsupported package manager."
+fi
 ok "Basic dependencies installed."
 
 # ------------------------------------------------------------
-# Install/update Tailscale using the official installer.
+# 2. Install/update Tailscale using the official installer
 # ------------------------------------------------------------
 log "Installing/updating Tailscale..."
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -88,10 +87,10 @@ command -v tailscale >/dev/null 2>&1 || fail "tailscale command was not installe
 ok "Tailscale installed: $(tailscale version | head -n1)"
 
 # ------------------------------------------------------------
-# Persistent IP forwarding required by Exit Node.
+# 3. Enable and persist IP forwarding for Exit Node
 # ------------------------------------------------------------
 log "Enabling persistent IPv4/IPv6 forwarding..."
-cat >/etc/sysctl.d/99-tailscale-exit-node.conf <<'EOF'
+cat >/etc/sysctl.d/99-tailscale-cst-exit.conf <<'EOF'
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
@@ -105,7 +104,7 @@ sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
 ok "IP forwarding enabled and persisted."
 
 # ------------------------------------------------------------
-# Start tailscaled and enable it at boot when systemd exists.
+# 4. Start tailscaled and enable it at boot
 # ------------------------------------------------------------
 log "Starting tailscaled..."
 if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files tailscaled.service >/dev/null 2>&1; then
@@ -131,12 +130,12 @@ fi
 ok "tailscaled is running."
 
 # ------------------------------------------------------------
-# Join the Tailnet / configure the existing node.
+# 5. Join Tailnet and advertise this machine as Exit Node
 # ------------------------------------------------------------
 log "Configuring Tailnet and advertising this machine as an Exit Node..."
 
 if tailscale ip -4 >/dev/null 2>&1 || tailscale ip -6 >/dev/null 2>&1; then
-  # Existing authenticated node: do not unnecessarily re-authenticate it.
+  # Already authenticated: preserve node identity and only update settings.
   tailscale set \
     --hostname="$TAILSCALE_HOSTNAME" \
     --advertise-exit-node \
@@ -149,11 +148,11 @@ else
     --advertise-tags="$TAG"
 fi
 
-# Never keep the Auth Key in the environment longer than necessary.
+# Do not keep the Auth Key in the shell environment.
 unset AUTH_KEY
 
 # ------------------------------------------------------------
-# Wait for Tailscale addresses.
+# 6. Wait for Tailscale address and verify
 # ------------------------------------------------------------
 TS4=""
 TS6=""
@@ -164,17 +163,27 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
-[[ -n "$TS4" || -n "$TS6" ]] || fail "Tailscale joined but no Tailscale IP was assigned."
+[[ -n "$TS4" || -n "$TS6" ]] || {
+  tailscale status || true
+  fail "Tailscale joined but no Tailscale IP was assigned."
+}
+
+# Verify the local preference where available.
+PREFS="$(tailscale debug prefs 2>/dev/null || true)"
+if grep -qi 'AdvertiseExitNode.*true' <<<"$PREFS"; then
+  EXIT_STATE="enabled"
+else
+  EXIT_STATE="advertised/configured"
+fi
 
 # ------------------------------------------------------------
-# Final diagnostics.
+# Final output - never print the Auth Key
 # ------------------------------------------------------------
 log "Installation complete."
-printf '\n'
-printf '%-18s %s\n' 'Tailscale IPv4:' "${TS4:-N/A}"
+printf '\n%-18s %s\n' 'Tailscale IPv4:' "${TS4:-N/A}"
 printf '%-18s %s\n' 'Tailscale IPv6:' "${TS6:-N/A}"
 printf '%-18s %s\n' 'Hostname:' "$TAILSCALE_HOSTNAME"
-printf '%-18s %s\n' 'Exit Node:' 'advertised'
+printf '%-18s %s\n' 'Exit Node:' "$EXIT_STATE"
 printf '%-18s %s\n' 'Tag:' "$TAG"
 printf '%-18s %s\n' 'IPv4 forwarding:' "$(sysctl -n net.ipv4.ip_forward)"
 printf '%-18s %s\n' 'IPv6 forwarding:' "$(sysctl -n net.ipv6.conf.all.forwarding)"
@@ -185,19 +194,19 @@ tailscale status || true
 
 echo
 echo '--- exit-node related preferences ---'
-tailscale debug prefs 2>/dev/null | grep -Ei 'AdvertiseExitNode|AdvertiseRoutes|Hostname' || true
+grep -Ei 'AdvertiseExitNode|AdvertiseRoutes|Hostname' <<<"$PREFS" || true
 
 echo
 echo '============================================================'
-echo ' DONE'
+echo ' TAILSCALE EXIT NODE READY'
 echo '============================================================'
-echo 'This node advertises itself as a Tailscale Exit Node.'
+echo "Node: $TAILSCALE_HOSTNAME"
+echo "Tag : $TAG"
 echo
-echo 'For automatic approval, configure your Tailnet policy with:'
+echo 'Automatic Exit Node approval requires this one-time Tailnet policy:'
 echo '  "autoApprovers": {'
 echo '    "exitNode": ["tag:exit-node"]'
 echo '  }'
 echo
-echo 'If you use a custom grants/ACL policy, clients also need access to:'
-echo '  autogroup:internet'
+echo 'If your Tailnet uses a different tag, make the policy match TAILSCALE_TAG.'
 echo '============================================================'
