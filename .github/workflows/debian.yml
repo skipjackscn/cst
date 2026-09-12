@@ -34,7 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils sshpass curl ca-certificates jq unzip openssl
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl ca-certificates jq unzip openssl
           sudo chmod 0666 /dev/kvm 2>/dev/null || true
           WORK_DIR=/mnt/cst-debian-vm
           sudo mkdir -p "$WORK_DIR"
@@ -44,6 +44,9 @@ jobs:
           MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
           [ "$MEM_MB" -gt 4096 ] && MEM_MB=$((MEM_MB-1536))
           echo "VM_MEM=$MEM_MB" >> "$GITHUB_ENV"
+          ssh-keygen -q -t ed25519 -N '' -f "$WORK_DIR/bootstrap_key"
+          chmod 600 "$WORK_DIR/bootstrap_key"
+          echo "BOOTSTRAP_PUBLIC_KEY=$(cat "$WORK_DIR/bootstrap_key.pub")" >> "$GITHUB_ENV"
           [ -n "${ET_NETWORK_NAME:-}" ] && [ -n "${ET_NETWORK_SECRET:-}" ] || { echo '::error::EASYTIER_NETWORK_NAME and EASYTIER_NETWORK_SECRET are required'; exit 1; }
 
       - name: Download Debian and EasyTier
@@ -81,8 +84,11 @@ jobs:
           p = pathlib.Path('.')
           host = os.environ.get('VM_HOSTNAME', 'debian-kvm')
           rx_key = os.environ.get('RX_SSH_PUBLIC_KEY', '').strip()
+          bootstrap_key = os.environ.get('BOOTSTRAP_PUBLIC_KEY', '').strip()
           if not rx_key.startswith('ssh-ed25519 '):
               raise SystemExit('RX_SSH_PUBLIC_KEY is missing or invalid')
+          if not bootstrap_key.startswith('ssh-ed25519 '):
+              raise SystemExit('BOOTSTRAP_PUBLIC_KEY is missing or invalid')
 
           ssh_conf = textwrap.dedent('''\
           Port 22
@@ -96,7 +102,7 @@ jobs:
           UsePAM yes
           ''')
 
-          authorized_key = rx_key + '\n'
+          authorized_keys = rx_key + '\n' + bootstrap_key + '\n'
 
           ud = textwrap.dedent(f'''\
           #cloud-config
@@ -126,7 +132,7 @@ jobs:
               permissions: '0600'
               owner: root:root
               content: |
-          {textwrap.indent(authorized_key, '                ')}
+          {textwrap.indent(authorized_keys, '                ')}
           runcmd:
             - [bash, -c, "install -d -m 700 /root/.ssh; chown root:root /root/.ssh; passwd -d root || true; passwd -u root || true"]
             - [sshd, -t]
@@ -134,9 +140,7 @@ jobs:
             - [systemctl, restart, ssh]
           ''')
           p.joinpath('user-data').write_text(ud)
-          p.joinpath('meta-data').write_text(
-              'instance-id: cst-debian-kvm\nlocal-hostname: ' + host + '\n'
-          )
+          p.joinpath('meta-data').write_text('instance-id: cst-debian-kvm\nlocal-hostname: ' + host + '\n')
 
           def esc(value):
               return (value or '').replace('\\', '\\\\').replace('"', '\\"')
@@ -167,7 +171,6 @@ jobs:
                       host_part = f'[{host_part}]'
                   path = u.path or ''
                   return urlunsplit((u.scheme.lower(), f'{host_part}:{port}', path, u.query, u.fragment))
-
               x = x.rstrip('/')
               if x.startswith('['):
                   end = x.find(']')
@@ -186,11 +189,9 @@ jobs:
                       raise ValueError(f'invalid bracketed IPv6 peer: {x!r}')
                   ipaddress.IPv6Address(host_part)
                   return f'tcp://[{host_part}]:{port}'
-
               if x.count(':') >= 2:
                   ipaddress.IPv6Address(x)
                   return f'tcp://[{x}]:11010'
-
               host_part = x
               port = 11010
               if ':' in x:
@@ -264,13 +265,8 @@ jobs:
               raise SystemExit('no EasyTier peer URI was generated')
           for peer in parsed:
               u = urlsplit(peer)
-              if u.scheme not in {'tcp', 'udp', 'wg', 'ws', 'wss'} or not u.hostname:
+              if u.scheme not in {'tcp', 'udp', 'wg', 'ws', 'wss'} or not u.hostname or u.port is None or not 1 <= u.port <= 65535:
                   raise SystemExit(f'invalid generated EasyTier peer URI: {peer!r}')
-              if u.port is None or not 1 <= u.port <= 65535:
-                  raise SystemExit(f'invalid generated EasyTier peer port: {peer!r}')
-          print('--- EasyTier peer URI(s), normalized ---')
-          for peer in parsed:
-              print(peer)
           PY
           cloud-localds seed.iso user-data meta-data
           echo '--- EasyTier config (secret masked) ---'
@@ -309,11 +305,13 @@ jobs:
               tail -100 serial.log || true
               exit 1
             fi
-            if sshpass -p '' ssh \
+            if ssh \
+              -i "$WORK_DIR/bootstrap_key" \
+              -o IdentitiesOnly=yes \
               -o StrictHostKeyChecking=no \
               -o UserKnownHostsFile=/dev/null \
-              -o PreferredAuthentications=publickey,password \
-              -o PubkeyAuthentication=no \
+              -o PasswordAuthentication=no \
+              -o PreferredAuthentications=publickey \
               -o ConnectTimeout=5 \
               -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'echo ready' 2>/dev/null; then
               exit 0
@@ -335,8 +333,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          ssh_cmd=(sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1")
-          scp_cmd=(sshpass -p '' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$HOST_SSH_PORT")
+          ssh_cmd=(ssh -i "$WORK_DIR/bootstrap_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no -o PreferredAuthentications=publickey -o ConnectTimeout=15 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1")
+          scp_cmd=(scp -i "$WORK_DIR/bootstrap_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$HOST_SSH_PORT")
           cat > install.sh <<'SH'
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
@@ -346,14 +344,12 @@ jobs:
           unzip -o -j /tmp/easytier.zip -d /opt/easytier
           chmod +x /opt/easytier/easytier-core /opt/easytier/easytier-cli /opt/easytier/easytier-web* 2>/dev/null || true
           install -m 0600 /tmp/config.toml /opt/easytier/config.toml
-
           mkdir -p /dev/net
           if [ ! -e /dev/net/tun ]; then
             mknod /dev/net/tun c 10 200 2>/dev/null || true
             chmod 666 /dev/net/tun 2>/dev/null || true
           fi
           test -c /dev/net/tun || { echo '::error::/dev/net/tun is unavailable inside Debian VM'; exit 1; }
-
           passwd -d root || true
           passwd -u root || true
           mkdir -p /etc/ssh/sshd_config.d
@@ -370,7 +366,6 @@ jobs:
           sshd -t
           systemctl enable --now ssh
           systemctl restart ssh
-
           sysctl -w net.ipv4.ip_forward=1
           sysctl -w net.ipv4.conf.all.rp_filter=0
           sysctl -w net.ipv4.conf.default.rp_filter=0
@@ -379,13 +374,11 @@ jobs:
           net.ipv4.conf.all.rp_filter=0
           net.ipv4.conf.default.rp_filter=0
           EOF
-
           cat > /etc/systemd/system/easytier.service <<'EOF'
           [Unit]
           Description=EasyTier VPN
           Wants=network-online.target
           After=network-online.target
-
           [Service]
           Type=simple
           ExecStart=/opt/easytier/easytier-core --config-file /opt/easytier/config.toml
@@ -394,11 +387,9 @@ jobs:
           LimitNOFILE=1048576
           AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
           CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-
           [Install]
           WantedBy=multi-user.target
           EOF
-
           systemctl daemon-reload
           systemctl enable easytier
           systemctl restart easytier
@@ -406,13 +397,11 @@ jobs:
           systemctl --no-pager --full status easytier || true
           journalctl -u easytier -n 100 --no-pager || true
           systemctl is-active --quiet easytier || { echo '::error::EasyTier failed to start'; exit 1; }
-
           for i in $(seq 1 60); do
             ip link show et0 >/dev/null 2>&1 && break
             sleep 2
           done
           ip link show et0 >/dev/null 2>&1 || { echo '::error::EasyTier et0 was not created'; journalctl -u easytier -n 100 --no-pager; exit 1; }
-
           OUT=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
           [ -n "$OUT" ] || { echo '::error::WAN interface not detected'; exit 1; }
           iptables -C INPUT -p tcp --dport 2222 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 2222 -j ACCEPT
@@ -430,7 +419,7 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'bash -s' <<'SH'
+          ssh -i "$WORK_DIR/bootstrap_key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no -o PreferredAuthentications=publickey -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'bash -s' <<'SH'
           set -e
           systemctl is-active --quiet easytier
           ip -4 addr show et0 | grep -q '10.1.1.51'
