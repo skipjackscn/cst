@@ -80,6 +80,18 @@ jobs:
           p = pathlib.Path('.')
           host = os.environ.get('VM_HOSTNAME', 'debian-kvm')
 
+          ssh_conf = textwrap.dedent('''\
+          Port 22
+          Port 2222
+          ListenAddress 0.0.0.0
+          ListenAddress ::
+          PasswordAuthentication yes
+          PermitEmptyPasswords yes
+          PermitRootLogin yes
+          PubkeyAuthentication yes
+          UsePAM yes
+          ''')
+
           ud = textwrap.dedent(f'''\
           #cloud-config
           hostname: {host}
@@ -98,9 +110,17 @@ jobs:
               - name: root
                 password: ''
                 type: text
+          write_files:
+            - path: /etc/ssh/sshd_config.d/99-cst-root-ssh.conf
+              permissions: '0644'
+              owner: root:root
+              content: |
+          {textwrap.indent(ssh_conf, '                ')}
           runcmd:
             - [bash, -c, "passwd -d root || true; passwd -u root || true"]
+            - [sshd, -t]
             - [systemctl, enable, --now, ssh]
+            - [systemctl, restart, ssh]
           ''')
           p.joinpath('user-data').write_text(ud)
           p.joinpath('meta-data').write_text(
@@ -117,7 +137,6 @@ jobs:
               x = raw.strip()
               if not x:
                   return None
-
               if '://' in x:
                   u = urlsplit(x)
                   if u.scheme.lower() not in {'tcp', 'udp', 'wg', 'ws', 'wss'}:
@@ -139,7 +158,6 @@ jobs:
                   return urlunsplit((u.scheme.lower(), f'{host_part}:{port}', path, u.query, u.fragment))
 
               x = x.rstrip('/')
-
               if x.startswith('['):
                   end = x.find(']')
                   if end < 0:
@@ -281,13 +299,33 @@ jobs:
           set -euo pipefail
           cd "$WORK_DIR"
           for i in $(seq 1 120); do
-            if sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=5 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'echo ready' 2>/dev/null; then
+            if sshpass -p '' ssh \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              -o PreferredAuthentications=password \
+              -o PubkeyAuthentication=no \
+              -o ConnectTimeout=5 \
+              -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'echo ready'; then
+              echo 'Initial root SSH with empty password is ready.'
               exit 0
+            fi
+            if ! kill -0 "$(cat qemu.pid)" 2>/dev/null; then
+              echo '::error::QEMU process exited before SSH became available.'
+              tail -200 qemu.log || true
+              tail -200 serial.log || true
+              exit 1
+            fi
+            if [ $((i % 12)) -eq 0 ]; then
+              echo "Still waiting for root SSH... ${i}/120"
+              tail -40 serial.log 2>/dev/null || true
             fi
             sleep 5
           done
-          tail -100 qemu.log || true
-          tail -100 serial.log || true
+          echo '::error::Timed out waiting for initial root SSH.'
+          echo '--- QEMU log ---'
+          tail -200 qemu.log || true
+          echo '--- serial log ---'
+          tail -200 serial.log || true
           exit 1
 
       - name: Install EasyTier and expose SSH 2222
@@ -326,6 +364,7 @@ jobs:
           PermitEmptyPasswords yes
           PermitRootLogin yes
           PubkeyAuthentication yes
+          UsePAM yes
           EOF
           sshd -t
           systemctl enable --now ssh
@@ -401,13 +440,12 @@ jobs:
           iptables -C INPUT -p tcp --dport 2222 -j ACCEPT
           test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
           iptables -t nat -S | grep -q MASQUERADE
-          test "$(passwd -S root | awk '{print $2}')" = NP
-          echo 'EasyTier exit-node + root empty-password SSH + 10.1.1.51:2222 + NAT: OK'
+          echo 'EasyTier exit-node + 10.1.1.51:2222 SSH + NAT: OK'
           SH
 
       - name: Keep VM alive
         shell: bash
         run: |
-          echo "Debian 13 QEMU/KVM + EasyTier exit node is ready."
+          echo 'Debian 13 QEMU/KVM + EasyTier exit node is ready.'
           echo "SSH: ssh -p 2222 root@10.1.1.51"
           sleep "${KEEP_ALIVE_MINUTES}m"
