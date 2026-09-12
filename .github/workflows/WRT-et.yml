@@ -6,7 +6,7 @@
 #   EASYTIER_NETWORK_SECRET   必填
 #   EASYTIER_PEER             可选，默认 tcp://public.easytier.cn:11010
 
-name: Win RDP et ex
+name: Win RDP et
 
 on:
   #- cron: '23 1 * * *'
