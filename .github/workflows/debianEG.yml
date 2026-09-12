@@ -1,4 +1,4 @@
-name: Debian 13 QEMU/KVM GPT
+name: Debian 13 E Gpt
 
 on:
   workflow_dispatch:
