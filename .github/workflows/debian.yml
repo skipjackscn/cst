@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  VM_USER: NvdAdmin
+  VM_USER: root
   VM_HOSTNAME: debian-kvm
   HOST_SSH_PORT: '2222'
   ET_HOSTNAME: gh-et
@@ -26,7 +26,6 @@ jobs:
       ET_NETWORK_NAME: ${{ secrets.EASYTIER_NETWORK_NAME }}
       ET_NETWORK_SECRET: ${{ secrets.EASYTIER_NETWORK_SECRET }}
       ET_PEER: ${{ secrets.EASYTIER_PEER }}
-      VM_PASSWORD: ${{ secrets.DEBIAN_ROOT_PASSWORD }}
 
     steps:
       - name: Prepare runner
@@ -70,11 +69,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          PASS="${VM_PASSWORD:-}"
-          [ -n "$PASS" ] || PASS=$(openssl rand -base64 18)
-          printf '%s' "$PASS" > .vm_password
-          chmod 600 .vm_password
-          export HASH="$(openssl passwd -6 "$PASS")"
           python3 - <<'PY'
           import ipaddress
           import os
@@ -84,9 +78,7 @@ jobs:
           from urllib.parse import urlsplit, urlunsplit
 
           p = pathlib.Path('.')
-          user = os.environ.get('VM_USER', 'NvdAdmin')
           host = os.environ.get('VM_HOSTNAME', 'debian-kvm')
-          h = os.environ['HASH']
 
           ud = textwrap.dedent(f'''\
           #cloud-config
@@ -94,15 +86,20 @@ jobs:
           fqdn: {host}
           manage_etc_hosts: true
           ssh_pwauth: true
-          disable_root: true
+          disable_root: false
           users:
-            - name: {user}
-              groups: [sudo]
-              shell: /bin/bash
-              sudo: ALL=(ALL) NOPASSWD:ALL
+            - name: root
               lock_passwd: false
-              passwd: "{h}"
+              shell: /bin/bash
+              groups: [root]
+          chpasswd:
+            expire: false
+            users:
+              - name: root
+                password: ''
+                type: text
           runcmd:
+            - [bash, -c, "passwd -d root || true; passwd -u root || true"]
             - [systemctl, enable, --now, ssh]
           ''')
           p.joinpath('user-data').write_text(ud)
@@ -121,8 +118,6 @@ jobs:
               if not x:
                   return None
 
-              # EasyTier peer accepts URI form such as tcp://host:11010.
-              # Also accept plain hostname/IP/IPv6 and add tcp:// plus port.
               if '://' in x:
                   u = urlsplit(x)
                   if u.scheme.lower() not in {'tcp', 'udp', 'wg', 'ws', 'wss'}:
@@ -145,7 +140,6 @@ jobs:
 
               x = x.rstrip('/')
 
-              # Bracketed IPv6: [2001:db8::1] or [2001:db8::1]:11010
               if x.startswith('['):
                   end = x.find(']')
                   if end < 0:
@@ -164,12 +158,10 @@ jobs:
                   ipaddress.IPv6Address(host_part)
                   return f'tcp://[{host_part}]:{port}'
 
-              # Bare IPv6 address.
               if x.count(':') >= 2:
                   ipaddress.IPv6Address(x)
                   return f'tcp://[{x}]:11010'
 
-              # Plain IPv4/hostname, optionally with a numeric port.
               host_part = x
               port = 11010
               if ':' in x:
@@ -240,7 +232,6 @@ jobs:
           p.joinpath('config.toml').write_text(config_text)
           p.joinpath('config.toml').chmod(0o600)
 
-          # Local structural validation. This catches malformed peer URIs before QEMU starts.
           parsed = re.findall(r'^uri\s*=\s*"([^"]+)"$', config_text, re.MULTILINE)
           if not parsed:
               raise SystemExit('no EasyTier peer URI was generated')
@@ -289,9 +280,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          P=$(cat .vm_password)
           for i in $(seq 1 120); do
-            if sshpass -p "$P" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'echo ready' 2>/dev/null; then
+            if sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=5 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'echo ready' 2>/dev/null; then
               exit 0
             fi
             sleep 5
@@ -305,48 +295,52 @@ jobs:
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          P=$(cat .vm_password)
-          ssh_cmd=(sshpass -p "$P" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1")
-          scp_cmd=(sshpass -p "$P" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P "$HOST_SSH_PORT")
+          ssh_cmd=(sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15 -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1")
+          scp_cmd=(sshpass -p '' scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -P "$HOST_SSH_PORT")
           cat > install.sh <<'SH'
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends iptables iproute2 unzip ca-certificates curl iputils-ping openssh-server kmod
-          sudo install -d -m 0755 /opt/easytier
-          sudo unzip -o -j /tmp/easytier.zip -d /opt/easytier
-          sudo chmod +x /opt/easytier/easytier-core /opt/easytier/easytier-cli /opt/easytier/easytier-web* 2>/dev/null || true
-          sudo install -m 0600 /tmp/config.toml /opt/easytier/config.toml
+          apt-get update -y
+          apt-get install -y --no-install-recommends iptables iproute2 unzip ca-certificates curl iputils-ping openssh-server kmod
+          install -d -m 0755 /opt/easytier
+          unzip -o -j /tmp/easytier.zip -d /opt/easytier
+          chmod +x /opt/easytier/easytier-core /opt/easytier/easytier-cli /opt/easytier/easytier-web* 2>/dev/null || true
+          install -m 0600 /tmp/config.toml /opt/easytier/config.toml
 
-          sudo mkdir -p /dev/net
+          mkdir -p /dev/net
           if [ ! -e /dev/net/tun ]; then
-            sudo mknod /dev/net/tun c 10 200 2>/dev/null || true
-            sudo chmod 666 /dev/net/tun 2>/dev/null || true
+            mknod /dev/net/tun c 10 200 2>/dev/null || true
+            chmod 666 /dev/net/tun 2>/dev/null || true
           fi
           test -c /dev/net/tun || { echo '::error::/dev/net/tun is unavailable inside Debian VM'; exit 1; }
 
-          sudo tee /etc/ssh/sshd_config.d/99-cst-ssh.conf >/dev/null <<'EOF'
+          passwd -d root || true
+          passwd -u root || true
+          mkdir -p /etc/ssh/sshd_config.d
+          cat > /etc/ssh/sshd_config.d/99-cst-ssh.conf <<'EOF'
           Port 22
           Port 2222
           ListenAddress 0.0.0.0
           ListenAddress ::
           PasswordAuthentication yes
-          PermitRootLogin no
+          PermitEmptyPasswords yes
+          PermitRootLogin yes
+          PubkeyAuthentication yes
           EOF
-          sudo sshd -t
-          sudo systemctl enable --now ssh
-          sudo systemctl restart ssh
+          sshd -t
+          systemctl enable --now ssh
+          systemctl restart ssh
 
-          sudo sysctl -w net.ipv4.ip_forward=1
-          sudo sysctl -w net.ipv4.conf.all.rp_filter=0
-          sudo sysctl -w net.ipv4.conf.default.rp_filter=0
-          sudo tee /etc/sysctl.d/99-cst-easytier.conf >/dev/null <<'EOF'
+          sysctl -w net.ipv4.ip_forward=1
+          sysctl -w net.ipv4.conf.all.rp_filter=0
+          sysctl -w net.ipv4.conf.default.rp_filter=0
+          cat > /etc/sysctl.d/99-cst-easytier.conf <<'EOF'
           net.ipv4.ip_forward=1
           net.ipv4.conf.all.rp_filter=0
           net.ipv4.conf.default.rp_filter=0
           EOF
 
-          sudo tee /etc/systemd/system/easytier.service >/dev/null <<'EOF'
+          cat > /etc/systemd/system/easytier.service <<'EOF'
           [Unit]
           Description=EasyTier VPN
           Wants=network-online.target
@@ -365,42 +359,41 @@ jobs:
           WantedBy=multi-user.target
           EOF
 
-          sudo systemctl daemon-reload
-          sudo systemctl enable easytier
-          sudo systemctl restart easytier
+          systemctl daemon-reload
+          systemctl enable easytier
+          systemctl restart easytier
           sleep 5
 
           echo '--- EasyTier service status ---'
-          sudo systemctl --no-pager --full status easytier || true
+          systemctl --no-pager --full status easytier || true
           echo '--- EasyTier journal ---'
-          sudo journalctl -u easytier -n 100 --no-pager || true
-          sudo systemctl is-active --quiet easytier || { echo '::error::EasyTier failed to start'; exit 1; }
+          journalctl -u easytier -n 100 --no-pager || true
+          systemctl is-active --quiet easytier || { echo '::error::EasyTier failed to start'; exit 1; }
 
           for i in $(seq 1 60); do
             ip link show et0 >/dev/null 2>&1 && break
             sleep 2
           done
-          ip link show et0 >/dev/null 2>&1 || { echo '::error::EasyTier et0 was not created'; sudo journalctl -u easytier -n 100 --no-pager; exit 1; }
+          ip link show et0 >/dev/null 2>&1 || { echo '::error::EasyTier et0 was not created'; journalctl -u easytier -n 100 --no-pager; exit 1; }
 
           OUT=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
           [ -n "$OUT" ] || { echo '::error::WAN interface not detected'; exit 1; }
-          sudo iptables -C INPUT -p tcp --dport 2222 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -p tcp --dport 2222 -j ACCEPT
-          sudo iptables -C INPUT -i et0 -p tcp --dport 2222 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT 1 -i et0 -p tcp --dport 2222 -j ACCEPT
-          sudo iptables -C FORWARD -i et0 -o "$OUT" -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i et0 -o "$OUT" -j ACCEPT
-          sudo iptables -C FORWARD -i "$OUT" -o et0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -i "$OUT" -o et0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-          sudo iptables -t nat -C POSTROUTING -o "$OUT" -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -o "$OUT" -j MASQUERADE
+          iptables -C INPUT -p tcp --dport 2222 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p tcp --dport 2222 -j ACCEPT
+          iptables -C INPUT -i et0 -p tcp --dport 2222 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i et0 -p tcp --dport 2222 -j ACCEPT
+          iptables -C FORWARD -i et0 -o "$OUT" -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i et0 -o "$OUT" -j ACCEPT
+          iptables -C FORWARD -i "$OUT" -o et0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i "$OUT" -o et0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          iptables -t nat -C POSTROUTING -o "$OUT" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$OUT" -j MASQUERADE
           SH
           "${scp_cmd[@]}" easytier.zip config.toml "$VM_USER@127.0.0.1:/tmp/"
           "${scp_cmd[@]}" install.sh "$VM_USER@127.0.0.1:/tmp/install.sh"
-          "${ssh_cmd[@]}" 'sudo bash /tmp/install.sh'
+          "${ssh_cmd[@]}" 'bash /tmp/install.sh'
 
       - name: Verify EasyTier exit node and SSH 2222
         shell: bash
         run: |
           set -euo pipefail
           cd "$WORK_DIR"
-          P=$(cat .vm_password)
-          sshpass -p "$P" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'sudo bash -s' <<'SH'
+          sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no -p "$HOST_SSH_PORT" "$VM_USER@127.0.0.1" 'bash -s' <<'SH'
           set -e
           systemctl is-active --quiet easytier
           ip -4 addr show et0 | grep -q '10.1.1.51'
@@ -408,12 +401,13 @@ jobs:
           iptables -C INPUT -p tcp --dport 2222 -j ACCEPT
           test "$(cat /proc/sys/net/ipv4/ip_forward)" = 1
           iptables -t nat -S | grep -q MASQUERADE
-          echo 'EasyTier exit-node + 10.1.1.51:2222 SSH + NAT: OK'
+          test "$(passwd -S root | awk '{print $2}')" = NP
+          echo 'EasyTier exit-node + root empty-password SSH + 10.1.1.51:2222 + NAT: OK'
           SH
 
       - name: Keep VM alive
         shell: bash
         run: |
           echo "Debian 13 QEMU/KVM + EasyTier exit node is ready."
-          echo "SSH: ssh -p 2222 ${VM_USER}@10.1.1.51"
+          echo "SSH: ssh -p 2222 root@10.1.1.51"
           sleep "${KEEP_ALIVE_MINUTES}m"
